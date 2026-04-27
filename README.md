@@ -48,10 +48,36 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 cargo install bindgen-cli
 ```
 
+### 1a. Repo-Local No-Sudo Environment
+
+If your machine already has the needed user-space tools, you can use the repo-local environment instead of editing `~/.bashrc` or installing under `/opt`.
+
+```bash
+source env/activate.sh
+```
+
+This activation step:
+
+- prepends `/nfs/home/share/riscv-toolchain-gcc15-240613/bin`, `$HOME/.cargo/bin`, and `$HOME/.local/bin` to `PATH`
+- exports `CROSS_PREFIX=riscv64-unknown-linux-gnu-`
+- runs `scripts/check-env.sh`
+
+It does not install packages or modify shell startup files.
+
+If the preflight reports `bindgen` as missing, the default `make -f Makefile.camp configure` path still works for non-Rust tracks because `Makefile.camp` now auto-disables Rust. To force Rust on, use `RUST_MODE=enabled` after installing `bindgen`.
+During configure, QEMU may download missing wrap subprojects automatically when they are not already present locally.
+
 ### 2. Configure
 
 ```bash
 make -f Makefile.camp configure
+```
+
+To force Rust on or off explicitly:
+
+```bash
+make -f Makefile.camp configure RUST_MODE=enabled
+make -f Makefile.camp configure RUST_MODE=disabled
 ```
 
 ### 3. Build

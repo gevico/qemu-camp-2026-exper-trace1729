@@ -48,10 +48,36 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 cargo install bindgen-cli
 ```
 
+### 第一步补充：仓库内免 sudo 环境
+
+如果当前机器已经具备所需的用户态工具，可以使用仓库内环境，而不必修改 `~/.bashrc` 或安装到 `/opt`。
+
+```bash
+source env/activate.sh
+```
+
+激活脚本会：
+
+- 将 `/nfs/home/share/riscv-toolchain-gcc15-240613/bin`、`$HOME/.cargo/bin` 和 `$HOME/.local/bin` 加到 `PATH` 前面
+- 导出 `CROSS_PREFIX=riscv64-unknown-linux-gnu-`
+- 运行 `scripts/check-env.sh`
+
+该流程不会安装软件包，也不会修改 shell 启动文件。
+
+如果预检查显示缺少 `bindgen`，默认的 `make -f Makefile.camp configure` 仍然可以用于非 Rust 方向，因为 `Makefile.camp` 现在会自动关闭 Rust。若要强制开启 Rust，请先安装 `bindgen`，再使用 `RUST_MODE=enabled`。
+配置阶段如果发现缺少的 wrap 子项目不在本地，QEMU 会自动在线拉取。
+
 ### 第二步：配置
 
 ```bash
 make -f Makefile.camp configure
+```
+
+如果需要显式控制 Rust：
+
+```bash
+make -f Makefile.camp configure RUST_MODE=enabled
+make -f Makefile.camp configure RUST_MODE=disabled
 ```
 
 ### 第三步：编译

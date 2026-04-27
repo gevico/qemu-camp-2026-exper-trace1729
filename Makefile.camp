@@ -17,17 +17,58 @@ BUILD_DIR := $(SRC_DIR)/build
 
 # RISC-V cross compiler (for TCG testcases)
 CROSS_PREFIX ?= riscv64-unknown-elf-
+BINDGEN := $(strip $(shell command -v bindgen 2>/dev/null))
+RUST_MODE ?= auto
+SYSTEM_LIBFDT := $(strip $(shell pkg-config --exists libfdt 2>/dev/null && echo yes))
+LOCAL_DTC := $(strip $(shell test -f $(SRC_DIR)/subprojects/dtc/meson.build && echo yes))
+
+ifeq ($(RUST_MODE),auto)
+ifneq ($(BINDGEN),)
+RUST_CONFIGURE_FLAG := --enable-rust
+RUST_STATUS := auto-enabled (bindgen found at $(BINDGEN))
+else
+RUST_CONFIGURE_FLAG := --disable-rust
+RUST_STATUS := auto-disabled (bindgen not found)
+endif
+else ifeq ($(RUST_MODE),enabled)
+RUST_CONFIGURE_FLAG := --enable-rust
+ifneq ($(BINDGEN),)
+RUST_STATUS := forced enabled (bindgen found at $(BINDGEN))
+else
+RUST_STATUS := forced enabled (bindgen missing)
+endif
+else ifeq ($(RUST_MODE),disabled)
+RUST_CONFIGURE_FLAG := --disable-rust
+RUST_STATUS := forced disabled
+else
+$(error RUST_MODE must be one of: auto, enabled, disabled)
+endif
+
+DOWNLOAD_CONFIGURE_FLAG := --enable-download
+
+ifneq ($(SYSTEM_LIBFDT),)
+FDT_CONFIGURE_FLAG := --enable-fdt=system
+FDT_STATUS := system libfdt
+else ifneq ($(LOCAL_DTC),)
+FDT_CONFIGURE_FLAG := --enable-fdt=internal
+FDT_STATUS := internal libfdt from subprojects/dtc
+else
+FDT_CONFIGURE_FLAG := --enable-fdt=internal
+FDT_STATUS := internal libfdt via wrap download
+endif
 
 # Configure flags — one config to rule all experiments:
 #   riscv64-softmmu    : SoC/GPGPU QTest + CPU TCG system tests
 #   riscv64-linux-user : CPU TCG user-mode tests
-#   --enable-rust      : Rust experiment unit tests
+#   $(RUST_CONFIGURE_FLAG) : Rust experiment unit tests
 #   --cross-prefix     : bare-metal cross compiler for TCG testcases
 CONFIGURE_FLAGS := \
     --target-list=riscv64-softmmu,riscv64-linux-user \
     --extra-cflags='-O0 -g3' \
     --cross-prefix-riscv64=$(CROSS_PREFIX) \
-    --enable-rust
+    $(DOWNLOAD_CONFIGURE_FLAG) \
+    $(FDT_CONFIGURE_FLAG) \
+    $(RUST_CONFIGURE_FLAG)
 
 # Parallel jobs (default: nproc)
 NPROC := $(shell nproc 2>/dev/null || echo 4)
@@ -66,6 +107,8 @@ help:
 	@echo "  JOBS=N             Parallel jobs (default: $(NPROC))"
 	@echo "  CROSS_PREFIX=...   RISC-V cross compiler prefix"
 	@echo "                     (default: riscv64-unknown-elf-)"
+	@echo "  RUST_MODE=...      Rust configure policy: auto|enabled|disabled"
+	@echo "                     (default: auto)"
 	@echo "  V=1                Verbose output"
 
 # ─── Configure ────────────────────────────────────────────────────────
@@ -73,6 +116,14 @@ help:
 .PHONY: configure
 configure:
 	@mkdir -p $(BUILD_DIR)
+	@echo "--- Dependency downloads: enabled ---"
+	@echo "--- FDT mode: $(FDT_STATUS) ---"
+	@echo "--- Rust mode: $(RUST_STATUS) ---"
+	@if [ "$(RUST_MODE)" = "enabled" ] && [ -z "$(BINDGEN)" ]; then \
+	    echo "error: bindgen not found on PATH, but RUST_MODE=enabled was requested."; \
+	    echo "install bindgen or use RUST_MODE=auto/disabled for non-Rust tracks."; \
+	    exit 1; \
+	fi
 	cd $(BUILD_DIR) && $(SRC_DIR)/configure $(CONFIGURE_FLAGS)
 	@echo "--- Configure done ---"
 
@@ -154,8 +205,17 @@ RUST_QTEST_TESTS := test-i2c-gpio-init test-i2c-gpio-bitbang \
 
 RUST_UNIT_NAMES := test_i2c_bus_create test_i2c_bus_read_write test_i2c_bus_nack
 
+.PHONY: check-rust-config
+check-rust-config: $(BUILD_DIR)/config-host.mak
+	@if ! grep -q '^CONFIG_HAVE_RUST=y$$' $(BUILD_DIR)/config-host.mak 2>/dev/null && \
+	    ! grep -q '^#define CONFIG_HAVE_RUST$$' $(BUILD_DIR)/config-host.h 2>/dev/null; then \
+	    echo "error: Rust support is disabled in the current build."; \
+	    echo "reconfigure with RUST_MODE=enabled after installing bindgen to run Rust tests."; \
+	    exit 1; \
+	fi
+
 .PHONY: test-rust
-test-rust: build
+test-rust: check-rust-config build
 	@passed=0; \
 	echo "=== Rust unit tests (I2C bus) ==="; \
 	for t in $(RUST_UNIT_NAMES); do \
