@@ -36,6 +36,11 @@ static inline bool always_true_p(const RISCVCPUConfig *cfg __attribute__((__unus
     return true;
 }
 
+static inline bool has_ext_xg233(const RISCVCPUConfig *cfg)
+{
+    return cfg->ext_xg233;
+}
+
 static inline bool has_xmips_p(const RISCVCPUConfig *cfg)
 {
     return cfg->ext_xmipscbop || cfg->ext_xmipscmov || cfg->ext_xmipslsp;
