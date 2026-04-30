@@ -1219,12 +1219,12 @@ static uint32_t opcode_at(DisasContextBase *dcbase, target_ulong pc)
 
 /* Include the auto-generated decoder for 16 bit insn */
 #include "decode-insn16.c.inc"
-#include "decode-xg233.c.inc"
+#include "decode-Xg233ai.c.inc"
 #include "insn_trans/trans_rvzce.c.inc"
 #include "insn_trans/trans_zilsd.c.inc"
 #include "insn_trans/trans_rvzcmop.c.inc"
 #include "insn_trans/trans_rvzicfiss.c.inc"
-#include "insn_trans/trans_xg233.c.inc"
+#include "insn_trans/trans_Xg233ai.c.inc"
 
 /* Include decoders for factored-out extensions */
 #include "decode-XVentanaCondOps.c.inc"
@@ -1237,7 +1237,7 @@ const RISCVDecoder decoder_table[] = {
     { has_xmips_p, decode_xmips},
     { has_xthead_p, decode_xthead},
     { has_XVentanaCondOps_p, decode_XVentanaCodeOps},
-    { has_ext_xg233, decode_xg233},
+    { has_ext_Xg233ai, decode_Xg233ai},
 };
 
 const size_t decoder_table_size = ARRAY_SIZE(decoder_table);

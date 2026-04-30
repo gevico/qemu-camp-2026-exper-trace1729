@@ -5,7 +5,7 @@ gen = [
   decodetree.process('xthead.decode', extra_args: '--static-decode=decode_xthead'),
   decodetree.process('XVentanaCondOps.decode', extra_args: '--static-decode=decode_XVentanaCodeOps'),
   decodetree.process('xmips.decode', extra_args: '--static-decode=decode_xmips'),
-  decodetree.process('xg233.decode', extra_args: '--static-decode=decode_xg233'),
+  decodetree.process('Xg233ai.decode', extra_args: '--static-decode=decode_Xg233ai'),
 ]
 
 riscv_ss = ss.source_set()

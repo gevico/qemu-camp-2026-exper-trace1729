@@ -153,7 +153,7 @@ BOOL_FIELD(ext_XVentanaCondOps)
 BOOL_FIELD(ext_xmipscbop)
 BOOL_FIELD(ext_xmipscmov)
 BOOL_FIELD(ext_xmipslsp)
-BOOL_FIELD(ext_xg233)
+BOOL_FIELD(ext_Xg233ai)
 
 BOOL_FIELD(mmu)
 BOOL_FIELD(pmp)

@@ -267,7 +267,7 @@ const RISCVIsaExtData isa_edata_arr[] = {
     ISA_EXT_DATA_ENTRY(xtheadmempair, PRIV_VERSION_1_11_0, ext_xtheadmempair),
     ISA_EXT_DATA_ENTRY(xtheadsync, PRIV_VERSION_1_11_0, ext_xtheadsync),
     ISA_EXT_DATA_ENTRY(xventanacondops, PRIV_VERSION_1_12_0, ext_XVentanaCondOps),
-    ISA_EXT_DATA_ENTRY(xg233, PRIV_VERSION_1_12_0, ext_xg233),
+    ISA_EXT_DATA_ENTRY(Xg233ai, PRIV_VERSION_1_12_0, ext_Xg233ai),
 
     { },
 };
@@ -1371,7 +1371,7 @@ const RISCVCPUMultiExtConfig riscv_cpu_vendor_exts[] = {
     MULTI_EXT_CFG_BOOL("xmipscbop", ext_xmipscbop, false),
     MULTI_EXT_CFG_BOOL("xmipscmov", ext_xmipscmov, false),
     MULTI_EXT_CFG_BOOL("xmipslsp", ext_xmipslsp, false),
-    MULTI_EXT_CFG_BOOL("xg233", ext_xg233, false),
+    MULTI_EXT_CFG_BOOL("Xg233ai", ext_Xg233ai, false),
 
     { },
 };
@@ -3403,7 +3403,7 @@ static const TypeInfo riscv_cpu_type_infos[] = {
         .misa_ext = RVI | RVM | RVA | RVC | RVU,
         .priv_spec = PRIV_VERSION_1_12_0,
         .vext_spec = VEXT_VERSION_1_00_0,
-        .cfg.ext_xg233 = true,
+        .cfg.ext_Xg233ai = true,
         .cfg.ext_zicsr = true,
         .cfg.ext_zifencei = true,
         .cfg.mmu = true,
