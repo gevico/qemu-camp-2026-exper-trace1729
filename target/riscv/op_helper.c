@@ -814,3 +814,32 @@ void helper_dma(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ul
     }
 }
 
+
+void helper_sort(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
+{
+  size_t n = env->gpr[rd];
+  target_ulong arr = env->gpr[rs1];
+
+  // Need to set the mmu idx properly.
+  int mmu_idx = riscv_env_mmu_index(env, false);
+  MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
+
+  // Suppose we have an operation called sink, which 
+  // put the biggest number in the end of the array. 
+  // for any array of size n, we can call sink n-1 times to sort the array.
+  
+  for (size_t i = 0; i < n - 1; i++) { // i means the len of sorted array.
+    for (size_t j = 0; j < n - 1 - i; j++) { // we only need to compare between the unsorted array (arr[0..n-1-j])
+      target_ulong addr1 = arr + 4 * j;
+      target_ulong addr2 = arr + 4 * (j + 1);
+      target_ulong val1 = cpu_ldl_mmu(env, addr1, oi, GETPC());
+      target_ulong val2 = cpu_ldl_mmu(env, addr2, oi, GETPC());
+      if (val1 > val2) {
+        cpu_stl_mmu(env, addr1, val2, oi, GETPC());
+        cpu_stl_mmu(env, addr2, val1, oi, GETPC());
+      }
+    }
+
+  }
+
+}
