@@ -1293,6 +1293,11 @@ DEF_HELPER_4(sort, void, env, tl, tl, tl)
 DEF_HELPER_4(crush, void, env, tl, tl, tl)
 DEF_HELPER_4(expand, void, env, tl, tl, tl)
 DEF_HELPER_4(vdot, void, env, tl, tl, tl)
+DEF_HELPER_4(vrelu, void, env, tl, tl, tl)
+DEF_HELPER_4(vscale, void, env, tl, tl, tl)
+DEF_HELPER_4(vmax, void, env, tl, tl, tl)
+DEF_HELPER_4(gemm, void, env, tl, tl, tl)
+DEF_HELPER_4(vadd, void, env, tl, tl, tl)
 
 
 /* CFI (zicfiss) helpers */

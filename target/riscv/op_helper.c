@@ -937,3 +937,85 @@ void helper_vdot(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_u
   // store the result back to dst
   env->gpr[rd] = res;
 }
+
+void helper_vrelu(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
+{
+    size_t N = env->gpr[rs2];
+    target_ulong src = env->gpr[rs1];
+    target_ulong dst = env->gpr[rd];
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
+
+    for (size_t i = 0; i < N; i++) {
+        int32_t val = (int32_t)cpu_ldl_mmu(env, src + i * 4, oi, GETPC());
+        cpu_stl_mmu(env, dst + i * 4, val > 0 ? val : 0, oi, GETPC());
+    }
+}
+
+void helper_vscale(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
+{
+    target_ulong src = env->gpr[rs1];
+    target_ulong dst = env->gpr[rd];
+    int64_t scale = (int64_t)(int32_t)env->gpr[rs2];
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
+
+    for (int i = 0; i < 16; i++) {
+        int64_t val = (int64_t)(int32_t)cpu_ldl_mmu(env, src + i * 4, oi, GETPC());
+        int32_t res = (int32_t)(val * scale);
+        cpu_stl_mmu(env, dst + i * 4, res, oi, GETPC());
+    }
+}
+
+void helper_vmax(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
+{
+    size_t N = env->gpr[rs2];
+    target_ulong src = env->gpr[rs1];
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
+
+    int32_t max = (int32_t)cpu_ldl_mmu(env, src, oi, GETPC());
+    for (size_t i = 1; i < N; i++) {
+        int32_t val = (int32_t)cpu_ldl_mmu(env, src + i * 4, oi, GETPC());
+        if (val > max) {
+            max = val;
+        }
+    }
+    env->gpr[rd] = (target_long)(int32_t)max;
+}
+
+void helper_gemm(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
+{
+    target_ulong A = env->gpr[rs1];
+    target_ulong B = env->gpr[rs2];
+    target_ulong C = env->gpr[rd];
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            int64_t acc = 0;
+            for (int k = 0; k < 4; k++) {
+                int32_t av = (int32_t)cpu_ldl_mmu(env, A + (i * 4 + k) * 4, oi, GETPC());
+                int32_t bv = (int32_t)cpu_ldl_mmu(env, B + (k * 4 + j) * 4, oi, GETPC());
+                acc += (int64_t)av * (int64_t)bv;
+            }
+            cpu_stl_mmu(env, C + (i * 4 + j) * 4, (int32_t)acc, oi, GETPC());
+        }
+    }
+}
+
+void helper_vadd(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
+{
+    target_ulong A = env->gpr[rs1];
+    target_ulong B = env->gpr[rs2];
+    target_ulong C = env->gpr[rd];
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
+
+    for (int i = 0; i < 16; i++) {
+        int32_t av = (int32_t)cpu_ldl_mmu(env, A + i * 4, oi, GETPC());
+        int32_t bv = (int32_t)cpu_ldl_mmu(env, B + i * 4, oi, GETPC());
+        cpu_stl_mmu(env, C + i * 4, av + bv, oi, GETPC());
+    }
+}
