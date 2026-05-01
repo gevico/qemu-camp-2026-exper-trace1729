@@ -915,3 +915,25 @@ void helper_expand(CPURISCVState *env, target_ulong rd, target_ulong rs1, target
     cpu_stb_mmu(env, dst + 2 * i + 1, high, make_memop_idx(MO_UB, mmu_idx), GETPC());
   }
 }
+
+void helper_vdot(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2) {
+  target_ulong src1 = env->gpr[rs1];
+  target_ulong src2 = env->gpr[rs2];
+
+  // suppose we have two int32 array of len 16 src1[0..15], src2[0..15]
+  // we want to calculate the dot product of these two array and store the result in dst
+
+  int32_t res = 0;
+  for (int i = 0; i < 16; i++) {
+    // Need to set the mmu idx properly.
+    // Here we can use the same mmu idx for both load and store since they are all data access.
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    target_ulong addr1 = src1 + i * 4;
+    target_ulong addr2 = src2 + i * 4;
+    int32_t val1 = cpu_ldl_mmu(env, addr1, make_memop_idx(MO_UL, mmu_idx), GETPC());
+    int32_t val2 = cpu_ldl_mmu(env, addr2, make_memop_idx(MO_UL, mmu_idx), GETPC());
+    res += val1 * val2;
+  }
+  // store the result back to dst
+  env->gpr[rd] = res;
+}
