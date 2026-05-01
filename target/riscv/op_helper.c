@@ -843,3 +843,54 @@ void helper_sort(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_u
   }
 
 }
+
+static int __ceil(int a, int b) {
+  return (a + b - 1) / b;
+}
+
+void helper_crush(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
+{
+  #define mask(a) ((a & 0x0F))
+  size_t N = env->gpr[rs2];
+  target_ulong src = env->gpr[rs1];
+  target_ulong dst = env->gpr[rd];
+
+  // Need to set the mmu idx properly.
+  int mmu_idx = riscv_env_mmu_index(env, false);
+  MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
+
+  /* Suppose we have the following recurrence relation:
+   *  dst(i) = src(2*i+1) << 4 | src(2*i)
+   *  Now suppose we have an src array of size N
+   *    if N % 2 == 0,  the size of dst array is N/2, dst[N/2-1] = src[N-1] << 4 | src[N-2]
+   *    if N % 2 == 1,  the size of dst array is still N/2 where dst[N/2-1] = src[N-1]
+   * */
+
+  for (int i = 0; i < __ceil(N, 2) - 1; i++) {
+    target_ulong addr1 = src + (2 * i);
+    target_ulong addr2 = src + (2 * i + 1);
+    uint8_t val1 = cpu_ldb_mmu(env, addr1, oi, GETPC());
+    uint8_t val2 = cpu_ldb_mmu(env, addr2, oi, GETPC());
+    uint8_t res = (mask(val2) << 4) | mask(val1);
+    printf("val1: %u, val2: %u, res: %u\n", val1, val2, res);
+    cpu_stb_mmu(env, dst + i, res, oi, GETPC());
+  }
+  
+
+  if (N % 2 == 0) {
+    target_ulong addr1 = src + (N - 2);
+    target_ulong addr2 = src + (N - 1);
+    uint8_t val1 = cpu_ldb_mmu(env, addr1, oi, GETPC());
+    uint8_t val2 = cpu_ldb_mmu(env, addr2, oi, GETPC());
+    uint8_t res = (mask(val2) << 4) | mask(val1);
+    printf("val1: %u, val2: %u, res: %u\n", val1, val2, res);
+    cpu_stb_mmu(env, dst + __ceil(N, 2) - 1, res, oi, GETPC());
+    
+  } else {
+    target_ulong addr = src + (N - 1);
+    target_ulong val = cpu_ldl_mmu(env, addr, oi, GETPC());
+    cpu_stb_mmu(env, dst + __ceil(N, 2) - 1, mask(val), oi, GETPC());
+  }
+  
+}
+
