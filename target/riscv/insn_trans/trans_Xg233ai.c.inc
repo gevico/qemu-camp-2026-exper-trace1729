@@ -16,3 +16,8 @@ static bool trans_crush(DisasContext *ctx, arg_r *a) {
     gen_helper_crush(tcg_env, tcg_constant_tl(a->rd), tcg_constant_tl(a->rs1), tcg_constant_tl(a->rs2));    
     return true;
 }
+
+static bool trans_expand(DisasContext *ctx, arg_r *a) {
+    gen_helper_expand(tcg_env, tcg_constant_tl(a->rd), tcg_constant_tl(a->rs1), tcg_constant_tl(a->rs2));    
+    return true;
+}

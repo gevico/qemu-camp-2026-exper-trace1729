@@ -848,9 +848,11 @@ static int __ceil(int a, int b) {
   return (a + b - 1) / b;
 }
 
+#define mask(a) ((a & 0x0F))
+
 void helper_crush(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
 {
-  #define mask(a) ((a & 0x0F))
+
   size_t N = env->gpr[rs2];
   target_ulong src = env->gpr[rs1];
   target_ulong dst = env->gpr[rd];
@@ -894,3 +896,22 @@ void helper_crush(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_
   
 }
 
+void helper_expand(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2) {
+  size_t N = env->gpr[rs2];
+  target_ulong src = env->gpr[rs1];
+  target_ulong dst = env->gpr[rd];
+
+  // Need to set the mmu idx properly.
+  int mmu_idx = riscv_env_mmu_index(env, false);
+  
+  // suppose we have the src array src[0..N-1]
+  // dst[2*i] = src[i] & 0x0F, dst[2*i+1] = (src[i] >> 4) & 0x0F
+  for (int i = 0; i < N; i++) {
+    target_ulong addr = src + i;
+    uint8_t val = cpu_ldb_mmu(env, addr, make_memop_idx(MO_UB, mmu_idx), GETPC());
+    uint8_t low = mask(val);
+    uint8_t high = mask(val >> 4);
+    cpu_stb_mmu(env, dst + 2 * i, low, make_memop_idx(MO_UB, mmu_idx), GETPC());
+    cpu_stb_mmu(env, dst + 2 * i + 1, high, make_memop_idx(MO_UB, mmu_idx), GETPC());
+  }
+}
