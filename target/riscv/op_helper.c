@@ -780,4 +780,37 @@ done:
     riscv_raise_exception(env, exception, GETPC());
 }
 
+
 #endif /* !CONFIG_USER_ONLY */
+
+/**
+ * N = {8, 16, 32}[gpr[rs2]]
+for i in 0..N-1:
+    for j in 0..N-1:
+        dst[j * N + i] = src[i * N + j]      // FP32, 4 bytes each
+where src = mem at gpr[rs1], dst = mem at gpr[rd]
+*/
+void helper_dma(CPURISCVState *env, target_ulong rd, target_ulong rs1, target_ulong rs2)
+{
+    size_t N = 0;
+    switch (env->gpr[rs2]) {
+        case 0: N = 8; break;
+        case 1: N = 16; break;
+        case 2: N = 32; break;
+        default: return;
+    }
+    // Need to set the mmu idx properly.
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
+
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            target_ulong src_addr = env->gpr[rs1] + (i * N + j) * 4;
+            target_ulong dst_addr = env->gpr[rd] + (j * N + i) * 4;
+            target_ulong val = 0;
+            val = cpu_ldl_mmu(env, src_addr, oi, GETPC());
+            cpu_stl_mmu(env, dst_addr, val, oi, GETPC());
+        }
+    }
+}
+
