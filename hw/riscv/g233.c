@@ -46,6 +46,7 @@
 #include "hw/misc/sifive_test.h"
 #include "hw/gpio/g233_gpio.h"
 #include "hw/timer/g233_pwm.h"
+#include "hw/watchdog/g233_wdt.h"
 #include "hw/core/platform-bus.h"
 #include "chardev/char.h"
 #include "system/device_tree.h"
@@ -106,6 +107,7 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_DRAM] =         { 0x80000000,           0x0 },
     [VIRT_GPIO] =         { 0x10012000,         0x100 },
     [VIRT_PWM] =          { 0x10015000,        0x1000 },
+    [VIRT_WDT] =          { 0x10010000,        0x1000 },
 };
 
 /* PCIe high mmio is fixed for RV32 */
@@ -1724,6 +1726,9 @@ static void virt_machine_init(MachineState *machine)
 
     g233_pwm_create(s->memmap[VIRT_PWM].base,
                     qdev_get_gpio_in(mmio_irqchip, PWM_IRQ));
+
+    g233_wdt_create(s->memmap[VIRT_WDT].base,
+                    qdev_get_gpio_in(mmio_irqchip, WDT_IRQ));
 
     for (i = 0; i < ARRAY_SIZE(s->flash); i++) {
         /* Map legacy -drive if=pflash to machine properties */
