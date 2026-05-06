@@ -44,6 +44,7 @@
 #include "hw/intc/riscv_aplic.h"
 #include "hw/intc/sifive_plic.h"
 #include "hw/misc/sifive_test.h"
+#include "hw/gpio/g233_gpio.h"
 #include "hw/core/platform-bus.h"
 #include "chardev/char.h"
 #include "system/device_tree.h"
@@ -102,6 +103,7 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_PCIE_ECAM] =    { 0x30000000,    0x10000000 },
     [VIRT_PCIE_MMIO] =    { 0x40000000,    0x40000000 },
     [VIRT_DRAM] =         { 0x80000000,           0x0 },
+    [VIRT_GPIO] =         { 0x10012000,         0x100 },
 };
 
 /* PCIe high mmio is fixed for RV32 */
@@ -1714,6 +1716,9 @@ static void virt_machine_init(MachineState *machine)
 
     sysbus_create_simple("goldfish_rtc", s->memmap[VIRT_RTC].base,
         qdev_get_gpio_in(mmio_irqchip, RTC_IRQ));
+
+    g233_gpio_create(s->memmap[VIRT_GPIO].base,
+                     qdev_get_gpio_in(mmio_irqchip, GPIO_IRQ));
 
     for (i = 0; i < ARRAY_SIZE(s->flash); i++) {
         /* Map legacy -drive if=pflash to machine properties */
