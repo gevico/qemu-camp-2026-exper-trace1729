@@ -47,6 +47,8 @@
 #include "hw/gpio/g233_gpio.h"
 #include "hw/timer/g233_pwm.h"
 #include "hw/watchdog/g233_wdt.h"
+#include "hw/ssi/g233_spi.h"
+#include "hw/ssi/ssi.h"
 #include "hw/core/platform-bus.h"
 #include "chardev/char.h"
 #include "system/device_tree.h"
@@ -108,6 +110,7 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_GPIO] =         { 0x10012000,         0x100 },
     [VIRT_PWM] =          { 0x10015000,        0x1000 },
     [VIRT_WDT] =          { 0x10010000,        0x1000 },
+    [VIRT_SPI] =          { 0x10018000,        0x1000 },
 };
 
 /* PCIe high mmio is fixed for RV32 */
@@ -1729,6 +1732,33 @@ static void virt_machine_init(MachineState *machine)
 
     g233_wdt_create(s->memmap[VIRT_WDT].base,
                     qdev_get_gpio_in(mmio_irqchip, WDT_IRQ));
+
+    {
+        SSIBus *spi_bus;
+        DeviceState *spi_dev, *flash;
+
+        spi_dev = g233_spi_create(s->memmap[VIRT_SPI].base,
+                                  qdev_get_gpio_in(mmio_irqchip, SPI_IRQ),
+                                  &spi_bus);
+
+        flash = qdev_new("w25x16");
+        qdev_prop_set_uint8(flash, "cs", 0);
+        ssi_realize_and_unref(flash, spi_bus, &error_fatal);
+        flash = ssi_get_cs(spi_bus, 0);
+        if (flash) {
+            qemu_irq cs_irq = qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0);
+            qdev_connect_gpio_out(DEVICE(spi_dev), 0, cs_irq);
+        }
+
+        flash = qdev_new("w25x32");
+        qdev_prop_set_uint8(flash, "cs", 1);
+        ssi_realize_and_unref(flash, spi_bus, &error_fatal);
+        flash = ssi_get_cs(spi_bus, 1);
+        if (flash) {
+            qemu_irq cs_irq = qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0);
+            qdev_connect_gpio_out(DEVICE(spi_dev), 1, cs_irq);
+        }
+    }
 
     for (i = 0; i < ARRAY_SIZE(s->flash); i++) {
         /* Map legacy -drive if=pflash to machine properties */
