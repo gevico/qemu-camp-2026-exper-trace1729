@@ -46,6 +46,74 @@ static int32_t imm_S(uint32_t inst) { return SEXT((BITS(inst, 31, 25) << 5) | BI
 static int32_t imm_B(uint32_t inst) { return SEXT((BITS(inst, 31, 31) << 11 | BITS(inst, 7, 7) << 10 | BITS(inst, 30, 25) << 4 | BITS(inst, 11, 8)), 12) << 1; }
 static int32_t imm_J(uint32_t inst) { return SEXT((BITS(inst, 31, 31) << 19 | BITS(inst, 19, 12) << 11 | BITS(inst, 20, 20) << 10 | BITS(inst, 30, 21)), 20) << 1; }
 
+/* LP conversion: quantize float32 → low-precision; reverse direction is identity */
+
+static uint32_t float32_to_bf16(uint32_t val)
+{
+    return val & 0xFFFF0000;
+}
+
+static uint32_t float32_to_e4m3(uint32_t val)
+{
+    uint32_t sign = val & 0x80000000;
+    uint32_t abs_v = val & 0x7FFFFFFF;
+    if (abs_v == 0) return 0;
+    if (((abs_v >> 23) & 0xFF) == 0xFF) return sign | 0x43E00000;
+    int32_t exp_val = ((abs_v >> 23) & 0xFF) - 127;
+    uint32_t m24 = ((abs_v >> 23) & 0xFF) == 0 ?
+        ((abs_v & 0x7FFFFF) << 1) : (abs_v & 0x7FFFFF) | 0x800000;
+    if (exp_val > 8)  return sign | 0x43E00000;
+    if (exp_val < -6) return 0;
+    uint32_t m4 = (m24 + (1 << 19)) >> 20;
+    if (m4 >= 16) { m4 >>= 1; exp_val++; }
+    if (exp_val > 8)  return sign | 0x43E00000;
+    if (exp_val < -6) return 0;
+    uint32_t out_exp = exp_val + 127;
+    return sign | (out_exp << 23) | ((m4 & 0x7) << 20);
+}
+
+static uint32_t float32_to_e5m2(uint32_t val)
+{
+    uint32_t sign = val & 0x80000000;
+    uint32_t abs_v = val & 0x7FFFFFFF;
+    if (abs_v == 0) return 0;
+    if (((abs_v >> 23) & 0xFF) == 0xFF) return sign | 0x46FFC000;
+    int32_t exp_val = ((abs_v >> 23) & 0xFF) - 127;
+    uint32_t m24 = ((abs_v >> 23) & 0xFF) == 0 ?
+        ((abs_v & 0x7FFFFF) << 1) : (abs_v & 0x7FFFFF) | 0x800000;
+    if (exp_val > 15)  return sign | 0x46FFC000;
+    if (exp_val < -14) return 0;
+    uint32_t m3 = (m24 + (1 << 20)) >> 21;
+    if (m3 >= 8) { m3 >>= 1; exp_val++; }
+    if (exp_val > 15)  return sign | 0x46FFC000;
+    if (exp_val < -14) return 0;
+    uint32_t out_exp = exp_val + 127;
+    return sign | (out_exp << 23) | ((m3 & 0x3) << 21);
+}
+
+/* E2M1 tables */
+static const uint32_t e2m1_table[8] = {
+    0x00000000, 0x3F000000, 0x3F800000, 0x3FC00000,
+    0x40000000, 0x40400000, 0x40800000, 0x40C00000,
+};
+static const uint32_t e2m1_thresh[7] = {
+    0x3E800000, 0x3F200000, 0x3F600000, 0x3FA00000,
+    0x40200000, 0x40600000, 0x41000000,
+};
+
+static uint32_t float32_to_e2m1(uint32_t val)
+{
+    uint32_t sign = val & 0x80000000;
+    uint32_t abs_v = val & 0x7FFFFFFF;
+    if (abs_v == 0) return 0;
+    if (((abs_v >> 23) & 0xFF) >= 0xFE) return sign | 0x40C00000;
+    int idx = 7;
+    for (int i = 0; i < 7; i++) {
+        if (abs_v < e2m1_thresh[i]) { idx = i; break; }
+    }
+    return sign | e2m1_table[idx];
+}
+
 void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
                           uint32_t thread_id_base, const uint32_t block_id[3],
                           uint32_t num_threads,
@@ -306,6 +374,42 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                             lane->gpr[rd] = float32_to_int32(fs1,
                                 &lane->fp_status);
                         }
+                    }
+                    break;
+                case 0x22: /* LP: BF16: funct5=01000, fmt=10 */
+                    if (funct3 == 0) {
+                        if (rs2 != 0) {
+                            lane->fpr[rd] = float32_to_bf16(lane->fpr[rs1]);
+                        } else {
+                            lane->fpr[rd] = lane->fpr[rs1];
+                        }
+                    }
+                    break;
+                case 0x24: /* LP: E4M3/E5M2: funct5=01001, fmt=00 */
+                    if (funct3 == 0) {
+                        if (rs2 == 1) {
+                            lane->fpr[rd] = float32_to_e4m3(lane->fpr[rs1]);
+                        } else if (rs2 == 0) {
+                            lane->fpr[rd] = lane->fpr[rs1];
+                        } else if (rs2 == 3) {
+                            lane->fpr[rd] = float32_to_e5m2(lane->fpr[rs1]);
+                        } else if (rs2 == 2) {
+                            lane->fpr[rd] = lane->fpr[rs1];
+                        }
+                    }
+                    break;
+                case 0x26: /* LP: E2M1: funct5=01001, fmt=10 */
+                    if (funct3 == 0) {
+                        if (rs2 != 0) {
+                            lane->fpr[rd] = float32_to_e2m1(lane->fpr[rs1]);
+                        } else {
+                            lane->fpr[rd] = lane->fpr[rs1];
+                        }
+                    }
+                    break;
+                case 0x78: /* FMV.W.X / FMV.X.W */
+                    if (funct3 == 0) {
+                        lane->fpr[rd] = lane->gpr[rs1]; /* fmv.w.x rd, rs1 */
                     }
                     break;
                 }
