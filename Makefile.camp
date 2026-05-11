@@ -181,7 +181,7 @@ GPGPU_SUBTESTS := device-id vram-size global-ctrl dispatch-regs \
 
 GPGPU_TOTAL := 17
 
-.PHONY: test-gpgpu
+.PHONY: test-gpgpu test-gpgpu-verbose
 test-gpgpu: build
 	@passed=0; \
 	export QTEST_QEMU_BINARY=$(BUILD_DIR)/qemu-system-riscv64; \
@@ -195,6 +195,25 @@ test-gpgpu: build
 	score=$$((passed * 100 / $(GPGPU_TOTAL))); \
 	echo "$$passed" > $(BUILD_DIR)/gpgpu-result.log; \
 	echo "--- GPGPU experiment: $$passed/$(GPGPU_TOTAL) tests passed, score $$score/100 ---"
+
+test-gpgpu-verbose: build
+	@export QTEST_QEMU_BINARY=$(BUILD_DIR)/qemu-system-riscv64; \
+	passed=0; total=0; \
+	for t in $(GPGPU_SUBTESTS); do \
+	    total=$$((total + 1)); \
+	    out=$$($(BUILD_DIR)/tests/qtest/qos-test \
+	        -p "/riscv64/virt/generic-pcihost/pci-bus-generic/pci-bus/gpgpu/gpgpu-tests/$$t" \
+	        --tap 2>&1); \
+	    result=$$(echo "$$out" | grep -E "^(ok|not ok)"); \
+	    if echo "$$result" | grep -q "^ok"; then \
+	        passed=$$((passed + 1)); \
+	        echo "PASS: $$t"; \
+	    else \
+	        err=$$(echo "$$out" | grep "ERROR:" | sed 's/.*gpgpu-test.c:[0-9]*://'); \
+	        echo "FAIL: $$t —$$err"; \
+	    fi; \
+	done; \
+	echo "--- $$passed/$$total passed ---"
 
 # ─── Rust experiment (3 unit tests + 7 QTest = 10 tests, 100 pts) ─────
 
