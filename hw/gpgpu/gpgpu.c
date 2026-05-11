@@ -90,6 +90,16 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return s->simt.lane_id;
     case GPGPU_REG_THREAD_MASK:
         return s->simt.thread_mask;
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        return (uint32_t)(s->kernel.kernel_addr);
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        return (uint32_t)(s->kernel.kernel_addr >> 32);
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        return (uint32_t)(s->kernel.kernel_args);
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        return (uint32_t)(s->kernel.kernel_args >> 32);
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        return s->kernel.shared_mem_size;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: bad read offset 0x%" HWADDR_PRIx "\n",
@@ -183,6 +193,30 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPGPU_REG_THREAD_MASK:
         s->simt.thread_mask = val;
+        break;
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        s->kernel.kernel_addr = (s->kernel.kernel_addr & 0xFFFFFFFF00000000ULL) | val;
+        break;
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        s->kernel.kernel_addr = (s->kernel.kernel_addr & 0xFFFFFFFFULL) | ((uint64_t)val << 32);
+        break;
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        s->kernel.kernel_args = (s->kernel.kernel_args & 0xFFFFFFFF00000000ULL) | val;
+        break;
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        s->kernel.kernel_args = (s->kernel.kernel_args & 0xFFFFFFFFULL) | ((uint64_t)val << 32);
+        break;
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        s->kernel.shared_mem_size = val;
+        break;
+    case GPGPU_REG_DISPATCH:
+        s->global_status = GPGPU_STATUS_BUSY;
+        gpgpu_core_exec_kernel(s);
+        s->global_status = GPGPU_STATUS_READY;
+        if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
+            s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
+            msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_KERNEL);
+        }
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
