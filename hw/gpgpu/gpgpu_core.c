@@ -480,17 +480,13 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
             GPGPUSIMTEntry *top = &warp->simt_stack[warp->simt_depth - 1];
             if (curr_pc == top->reconverge_pc) {
                 if (!top->then_done) {
-                    /* Then path done: switch to else path */
                     top->then_done = true;
                     warp->active_mask = top->else_mask;
                     next_pc = top->else_pc;
-                    /* switch to else path */
                 } else {
-                    /* Else path done: both paths complete. Pop stack. */
                     warp->active_mask = top->saved_mask;
-                    next_pc = top->reconverge_pc + 4;
+                    next_pc = top->reconverge_pc;
                     warp->simt_depth--;
-                    /* pop stack */
                 }
                 goto pc_update;
             }
@@ -518,7 +514,7 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
             entry->else_mask     = else_mask;
             entry->then_pc       = then_pc;
             entry->else_pc       = else_pc;
-            entry->reconverge_pc = then_pc < curr_pc ? else_pc : then_pc; /* forward: then_pc, backward: else_pc */
+            entry->reconverge_pc = then_pc < curr_pc ? else_pc : then_pc;
             entry->then_done     = false;
 
             /* Enter then path */
@@ -531,7 +527,6 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
         } else {
             /* Normal branch or no branch */
             if (opcode == 0x63 && (then_mask || else_mask)) {
-                /* Uniform branch (all lanes agree) */
                 branch_taken = (then_mask != 0);
                 branch_target = (then_mask != 0) ? (curr_pc + imm_B(inst)) : (curr_pc + 4);
             }
