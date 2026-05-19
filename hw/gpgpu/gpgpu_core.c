@@ -142,14 +142,25 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
 
     warp->active_mask = (num_threads >= 32) ?
         0xFFFFFFFF : ((1u << num_threads) - 1);
+    warp->simt_depth = 0;
 }
 
 int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 {
     for (uint32_t cycle = 0; cycle < max_cycles; cycle++) {
-        uint32_t inst = vram_readl(s, warp->lanes[0].pc);
+        uint32_t curr_pc = warp->lanes[0].pc;
 
-        if (inst == 0x00100073) break; /* ebreak */
+        /* Fetch instruction */
+        uint32_t inst = vram_readl(s, curr_pc);
+        if (inst == 0x00100073) {
+            /* ebreak: stop this warp */
+            for (int i = 0; i < GPGPU_WARP_SIZE; i++) {
+                if (warp->lanes[i].active) {
+                    warp->lanes[i].pc = curr_pc;
+                }
+            }
+            break;
+        }
 
         int rd   = BITS(inst, 11, 7);
         int rs1  = BITS(inst, 19, 15);
@@ -158,12 +169,14 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
         uint8_t funct3 = BITS(inst, 14, 12);
         uint8_t funct7 = BITS(inst, 31, 25);
 
-        /* Per-lane execution */
+        /* Per-lane execution, gated by active_mask */
         bool branch_taken = false;
-        uint32_t branch_target = warp->lanes[0].pc + 4;
+        uint32_t branch_target = curr_pc + 4;
+        uint32_t then_mask = 0;
+        uint32_t else_mask = 0;
 
         for (int i = 0; i < GPGPU_WARP_SIZE; i++) {
-            if (!warp->lanes[i].active) continue;
+            if (!(warp->active_mask & (1u << i))) continue;
             GPGPULane *lane = &warp->lanes[i];
 
             switch (opcode) {
@@ -174,7 +187,7 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 
             /* AUIPC: rd = pc + (imm20 << 12) */
             case 0x17:
-                lane->gpr[rd] = lane->pc + imm_U(inst);
+                lane->gpr[rd] = curr_pc + imm_U(inst);
                 break;
 
             /* OP-IMM: rd = rs1 op imm */
@@ -182,17 +195,17 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 int32_t imm = imm_I(inst);
                 uint32_t v1 = lane->gpr[rs1];
                 switch (funct3) {
-                case 0: lane->gpr[rd] = v1 + imm; break;          /* ADDI */
-                case 1: lane->gpr[rd] = v1 << (imm & 0x1F); break; /* SLLI */
-                case 2: lane->gpr[rd] = (int32_t)v1 < imm; break;  /* SLTI */
-                case 3: lane->gpr[rd] = v1 < (uint32_t)imm; break; /* SLTIU */
-                case 4: lane->gpr[rd] = v1 ^ imm; break;          /* XORI */
-                case 5:                                                 /* SRLI/SRAI */
+                case 0: lane->gpr[rd] = v1 + imm; break;           /* ADDI */
+                case 1: lane->gpr[rd] = v1 << (imm & 0x1F); break;  /* SLLI */
+                case 2: lane->gpr[rd] = (int32_t)v1 < imm; break;   /* SLTI */
+                case 3: lane->gpr[rd] = v1 < (uint32_t)imm; break;  /* SLTIU */
+                case 4: lane->gpr[rd] = v1 ^ imm; break;           /* XORI */
+                case 5:                                                  /* SRLI/SRAI */
                     if (funct7 & 0x20) lane->gpr[rd] = (int32_t)v1 >> (imm & 0x1F);
                     else              lane->gpr[rd] = v1 >> (imm & 0x1F);
                     break;
-                case 6: lane->gpr[rd] = v1 | imm; break;          /* ORI */
-                case 7: lane->gpr[rd] = v1 & imm; break;          /* ANDI */
+                case 6: lane->gpr[rd] = v1 | imm; break;           /* ORI */
+                case 7: lane->gpr[rd] = v1 & imm; break;           /* ANDI */
                 }
                 break;
             }
@@ -202,72 +215,60 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 uint32_t v1 = lane->gpr[rs1];
                 uint32_t v2 = lane->gpr[rs2];
                 if (funct7 == 0x01) {
-                    /* M extension: funct7=0x01 */
+                    /* M extension */
                     int64_t prod;
                     switch (funct3) {
-                    case 0: /* MUL */
+                    case 0:                                                 /* MUL */
                         lane->gpr[rd] = (int64_t)(int32_t)v1 * (int64_t)(int32_t)v2;
                         break;
-                    case 1: /* MULH */
+                    case 1:                                                 /* MULH */
                         prod = (int64_t)(int32_t)v1 * (int64_t)(int32_t)v2;
                         lane->gpr[rd] = (uint64_t)prod >> 32;
                         break;
-                    case 2: /* MULHSU */
+                    case 2:                                                 /* MULHSU */
                         prod = (int64_t)(int32_t)v1 * (uint64_t)v2;
                         lane->gpr[rd] = (uint64_t)prod >> 32;
                         break;
-                    case 3: /* MULHU */
+                    case 3:                                                 /* MULHU */
                         prod = (uint64_t)v1 * (uint64_t)v2;
                         lane->gpr[rd] = (uint64_t)prod >> 32;
                         break;
-                    case 4: /* DIV */
-                        if (v2 == 0)
-                            lane->gpr[rd] = 0xFFFFFFFF;
-                        else if ((int32_t)v1 == INT32_MIN && (int32_t)v2 == -1)
-                            lane->gpr[rd] = v1;
-                        else
-                            lane->gpr[rd] = (int32_t)v1 / (int32_t)v2;
+                    case 4:                                                 /* DIV */
+                        if (v2 == 0) lane->gpr[rd] = 0xFFFFFFFF;
+                        else if ((int32_t)v1 == INT32_MIN && (int32_t)v2 == -1) lane->gpr[rd] = v1;
+                        else lane->gpr[rd] = (int32_t)v1 / (int32_t)v2;
                         break;
-                    case 5: /* DIVU */
-                        if (v2 == 0)
-                            lane->gpr[rd] = 0xFFFFFFFF;
-                        else
-                            lane->gpr[rd] = v1 / v2;
+                    case 5:                                                 /* DIVU */
+                        if (v2 == 0) lane->gpr[rd] = 0xFFFFFFFF;
+                        else lane->gpr[rd] = v1 / v2;
                         break;
-                    case 6: /* REM */
-                        if (v2 == 0)
-                            lane->gpr[rd] = v1;
-                        else if ((int32_t)v1 == INT32_MIN && (int32_t)v2 == -1)
-                            lane->gpr[rd] = 0;
-                        else
-                            lane->gpr[rd] = (int32_t)v1 % (int32_t)v2;
+                    case 6:                                                 /* REM */
+                        if (v2 == 0) lane->gpr[rd] = v1;
+                        else if ((int32_t)v1 == INT32_MIN && (int32_t)v2 == -1) lane->gpr[rd] = 0;
+                        else lane->gpr[rd] = (int32_t)v1 % (int32_t)v2;
                         break;
-                    case 7: /* REMU */
-                        if (v2 == 0)
-                            lane->gpr[rd] = v1;
-                        else
-                            lane->gpr[rd] = v1 % v2;
+                    case 7:                                                 /* REMU */
+                        if (v2 == 0) lane->gpr[rd] = v1;
+                        else lane->gpr[rd] = v1 % v2;
                         break;
                     }
                 } else {
                     /* RV32I ALU operations */
                     switch (funct3) {
-                    case 0: /* ADD/SUB */
-                        if (funct7 == 0x00)
-                            lane->gpr[rd] = (int32_t)v1 + (int32_t)v2;
-                        else if (funct7 == 0x20)
-                            lane->gpr[rd] = (int32_t)v1 - (int32_t)v2;
+                    case 0:                                                 /* ADD/SUB */
+                        if (funct7 == 0x00) lane->gpr[rd] = (int32_t)v1 + (int32_t)v2;
+                        else if (funct7 == 0x20) lane->gpr[rd] = (int32_t)v1 - (int32_t)v2;
                         break;
-                    case 1: lane->gpr[rd] = v1 << (v2 & 0x1F); break;   /* SLL */
+                    case 1: lane->gpr[rd] = v1 << (v2 & 0x1F); break;    /* SLL */
                     case 2: lane->gpr[rd] = (int32_t)v1 < (int32_t)v2; break; /* SLT */
-                    case 3: lane->gpr[rd] = v1 < v2; break;              /* SLTU */
-                    case 4: lane->gpr[rd] = v1 ^ v2; break;              /* XOR */
-                    case 5: /* SRL/SRA */
+                    case 3: lane->gpr[rd] = v1 < v2; break;               /* SLTU */
+                    case 4: lane->gpr[rd] = v1 ^ v2; break;               /* XOR */
+                    case 5:                                                   /* SRL/SRA */
                         if (funct7 & 0x20) lane->gpr[rd] = (int32_t)v1 >> (v2 & 0x1F);
                         else              lane->gpr[rd] = v1 >> (v2 & 0x1F);
                         break;
-                    case 6: lane->gpr[rd] = v1 | v2; break;              /* OR */
-                    case 7: lane->gpr[rd] = v1 & v2; break;              /* AND */
+                    case 6: lane->gpr[rd] = v1 | v2; break;               /* OR */
+                    case 7: lane->gpr[rd] = v1 & v2; break;               /* AND */
                     }
                 }
                 break;
@@ -278,19 +279,19 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 int32_t imm = imm_I(inst);
                 uint32_t addr = lane->gpr[rs1] + imm;
                 switch (funct3) {
-                case 0: /* LB */
+                case 0:                                                     /* LB */
                     lane->gpr[rd] = (addr < s->vram_size) ? SEXT(s->vram_ptr[addr], 8) : 0;
                     break;
-                case 1: /* LH */
+                case 1:                                                     /* LH */
                     lane->gpr[rd] = (addr + 2 <= s->vram_size) ? SEXT(vram_readl(s, addr) & 0xFFFF, 16) : 0;
                     break;
-                case 2: /* LW */
+                case 2:                                                     /* LW */
                     lane->gpr[rd] = vram_readl(s, addr);
                     break;
-                case 4: /* LBU */
+                case 4:                                                     /* LBU */
                     lane->gpr[rd] = (addr < s->vram_size) ? s->vram_ptr[addr] : 0;
                     break;
-                case 5: /* LHU */
+                case 5:                                                     /* LHU */
                     lane->gpr[rd] = (addr + 2 <= s->vram_size) ? (vram_readl(s, addr) & 0xFFFF) : 0;
                     break;
                 }
@@ -302,22 +303,21 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 int32_t imm = imm_S(inst);
                 uint32_t addr = lane->gpr[rs1] + imm;
                 switch (funct3) {
-                case 0: /* SB */
+                case 0:                                                     /* SB */
                     if (addr < s->vram_size) s->vram_ptr[addr] = lane->gpr[rs2] & 0xFF;
                     break;
-                case 1: /* SH */
+                case 1:                                                     /* SH */
                     if (addr + 2 <= s->vram_size) memcpy(s->vram_ptr + addr, &lane->gpr[rs2], 2);
                     break;
-                case 2: /* SW */
+                case 2:                                                     /* SW */
                     vram_writel(s, addr, lane->gpr[rs2]);
                     break;
                 }
                 break;
             }
 
-            /* BRANCH */
+            /* BRANCH (divergence handled after lane loop) */
             case 0x63: {
-                int32_t imm = imm_B(inst);
                 uint32_t v1 = lane->gpr[rs1];
                 uint32_t v2 = lane->gpr[rs2];
                 bool taken = false;
@@ -330,8 +330,9 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 case 7: taken = (v1 >= v2); break;
                 }
                 if (taken) {
-                    branch_taken = true;
-                    branch_target = lane->pc + imm;
+                    then_mask |= (1u << i);
+                } else {
+                    else_mask |= (1u << i);
                 }
                 break;
             }
@@ -339,7 +340,7 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
             /* JALR */
             case 0x67: {
                 int32_t imm = imm_I(inst);
-                lane->gpr[rd] = lane->pc + 4;
+                lane->gpr[rd] = curr_pc + 4;
                 branch_taken = true;
                 branch_target = (lane->gpr[rs1] + imm) & ~1;
                 break;
@@ -348,18 +349,17 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
             /* JAL */
             case 0x6F: {
                 int32_t imm = imm_J(inst);
-                lane->gpr[rd] = lane->pc + 4;
+                lane->gpr[rd] = curr_pc + 4;
                 branch_taken = true;
-                branch_target = lane->pc + imm;
+                branch_target = curr_pc + imm;
                 break;
             }
 
-            /* SYSTEM (CSR, EBREAK, ECALL, MRET) */
+            /* SYSTEM (CSR) */
             case 0x73: {
                 uint32_t csr_num = BITS(inst, 31, 20);
                 if (funct3 == 0) {
-                    /* ECALL (0x00000000) / EBREAK (0x00100073) / MRET (0x30200073) */
-                    /* handled above by inst == 0x00100073 */
+                    /* ECALL / EBREAK / MRET - handled above by ebreak check */
                 } else if (funct3 == 1) { /* CSRRW */
                     uint64_t old = 0;
                     if (csr_num == CSR_MHARTID) old = lane->mhartid;
@@ -387,87 +387,73 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
             /* OP-FP (RV32F) */
             case 0x53: {
                 switch (funct7) {
-                case 0x00: /* FADD.S */
+                case 0x00:                                                  /* FADD.S */
                     if (funct3 == 0) {
                         float32 vs1 = make_float32(lane->fpr[rs1]);
                         float32 vs2 = make_float32(lane->fpr[rs2]);
                         lane->fpr[rd] = float32_add(vs1, vs2, &lane->fp_status);
                     }
                     break;
-                case 0x04: /* FSUB.S */
+                case 0x04:                                                  /* FSUB.S */
                     if (funct3 == 0) {
                         float32 vs1 = make_float32(lane->fpr[rs1]);
                         float32 vs2 = make_float32(lane->fpr[rs2]);
                         lane->fpr[rd] = float32_sub(vs1, vs2, &lane->fp_status);
                     }
                     break;
-                case 0x08: /* FMUL.S */
+                case 0x08:                                                  /* FMUL.S */
                     if (funct3 == 0) {
                         float32 vs1 = make_float32(lane->fpr[rs1]);
                         float32 vs2 = make_float32(lane->fpr[rs2]);
                         lane->fpr[rd] = float32_mul(vs1, vs2, &lane->fp_status);
                     }
                     break;
-                case 0x0C: /* FDIV.S */
+                case 0x0C:                                                  /* FDIV.S */
                     if (funct3 == 0) {
                         float32 vs1 = make_float32(lane->fpr[rs1]);
                         float32 vs2 = make_float32(lane->fpr[rs2]);
                         lane->fpr[rd] = float32_div(vs1, vs2, &lane->fp_status);
                     }
                     break;
-                case 0x68: /* FCVT.S.W: funct5=11010, fmt=00 → funct7=0x68 */
+                case 0x68:                                                  /* FCVT.S.W */
                     if ((funct3 & 0x7) == 0) {
-                        lane->fpr[rd] = int32_to_float32(
-                            lane->gpr[rs1], &lane->fp_status);
+                        lane->fpr[rd] = int32_to_float32(lane->gpr[rs1], &lane->fp_status);
                     }
                     break;
-                case 0x60: /* FCVT.W.S: funct5=11000, fmt=00 → funct7=0x60 */
+                case 0x60:                                                  /* FCVT.W.S */
                     {
                         float32 fs1 = make_float32(lane->fpr[rs1]);
                         int rm = rs2;
-                        if (rm == 1) { /* RTZ */
-                            lane->gpr[rd] = float32_to_int32_round_to_zero(
-                                fs1, &lane->fp_status);
+                        if (rm == 1) {                                      /* RTZ */
+                            lane->gpr[rd] = float32_to_int32_round_to_zero(fs1, &lane->fp_status);
                         } else {
-                            lane->gpr[rd] = float32_to_int32(fs1,
-                                &lane->fp_status);
+                            lane->gpr[rd] = float32_to_int32(fs1, &lane->fp_status);
                         }
                     }
                     break;
-                case 0x22: /* LP: BF16: funct5=01000, fmt=10 */
+                case 0x22:                                                  /* LP: BF16 */
                     if (funct3 == 0) {
-                        if (rs2 != 0) {
-                            lane->fpr[rd] = float32_to_bf16(lane->fpr[rs1]);
-                        } else {
-                            lane->fpr[rd] = lane->fpr[rs1];
-                        }
+                        if (rs2 != 0) lane->fpr[rd] = float32_to_bf16(lane->fpr[rs1]);
+                        else lane->fpr[rd] = lane->fpr[rs1];
                     }
                     break;
-                case 0x24: /* LP: E4M3/E5M2: funct5=01001, fmt=00 */
+                case 0x24:                                                  /* LP: E4M3/E5M2 */
                     if (funct3 == 0) {
-                        if (rs2 == 1) {
-                            lane->fpr[rd] = float32_to_e4m3(lane->fpr[rs1]);
-                        } else if (rs2 == 0) {
-                            lane->fpr[rd] = lane->fpr[rs1];
-                        } else if (rs2 == 3) {
-                            lane->fpr[rd] = float32_to_e5m2(lane->fpr[rs1]);
-                        } else if (rs2 == 2) {
-                            lane->fpr[rd] = lane->fpr[rs1];
-                        }
+                        if (rs2 == 1) lane->fpr[rd] = float32_to_e4m3(lane->fpr[rs1]);
+                        else if (rs2 == 0) lane->fpr[rd] = lane->fpr[rs1];
+                        else if (rs2 == 3) lane->fpr[rd] = float32_to_e5m2(lane->fpr[rs1]);
+                        else if (rs2 == 2) lane->fpr[rd] = lane->fpr[rs1];
                     }
                     break;
-                case 0x26: /* LP: E2M1: funct5=01001, fmt=10 */
+                case 0x26:                                                  /* LP: E2M1 */
                     if (funct3 == 0) {
-                        if (rs2 != 0) {
-                            lane->fpr[rd] = float32_to_e2m1(lane->fpr[rs1]);
-                        } else {
-                            lane->fpr[rd] = lane->fpr[rs1];
-                        }
+                        if (rs2 != 0) lane->fpr[rd] = float32_to_e2m1(lane->fpr[rs1]);
+                        else lane->fpr[rd] = lane->fpr[rs1];
                     }
                     break;
-                case 0x78: /* FMV.W.X / FMV.X.W */
+                case 0x78:                                                  /* FMV.W.X / FMV.X.W */
                     if (funct3 == 0) {
-                        lane->fpr[rd] = lane->gpr[rs1]; /* fmv.w.x rd, rs1 */
+                        lane->fpr[rd] = lane->gpr[rs1];                     /* fmv.w.x rd, rs1 */
                     }
                     break;
                 }
@@ -477,16 +463,83 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
             default:
                 qemu_log_mask(LOG_GUEST_ERROR,
                     "gpgpu_core: unknown opcode 0x%02x at pc=0x%x\n",
-                    opcode, lane->pc);
+                    opcode, curr_pc);
                 return -1;
             }
 
-            lane->gpr[0] = 0; /* x0 is always zero */
+            lane->gpr[0] = 0;
         }
 
-        /* Advance PC (lockstep: all active lanes share next PC) */
-        uint32_t next_pc = branch_taken ? branch_target :
-                           (warp->lanes[0].pc + 4);
+        /* ------------------------------------------------------------------
+         * SIMT Reconvergence Check (after instruction execution)
+         * If we just executed an instruction at the reconvergence point,
+         * switch to else path or pop the stack.
+         * ---------------------------------------------------------------- */
+        uint32_t next_pc;
+        if (warp->simt_depth > 0) {
+            GPGPUSIMTEntry *top = &warp->simt_stack[warp->simt_depth - 1];
+            if (curr_pc == top->reconverge_pc) {
+                if (!top->then_done) {
+                    /* Then path done: switch to else path */
+                    top->then_done = true;
+                    warp->active_mask = top->else_mask;
+                    next_pc = top->else_pc;
+                    /* switch to else path */
+                } else {
+                    /* Else path done: both paths complete. Pop stack. */
+                    warp->active_mask = top->saved_mask;
+                    next_pc = top->reconverge_pc + 4;
+                    warp->simt_depth--;
+                    /* pop stack */
+                }
+                goto pc_update;
+            }
+        }
+
+        /*
+         * Normal PC advance:
+         *  - BRANCH divergence: push SIMT stack, enter then path
+         *  - Normal branch: taken / not taken
+         *  - Otherwise: pc + 4
+         */
+        if (opcode == 0x63 && then_mask != 0 && else_mask != 0) {
+            /* Divergent branch: push SIMT stack */
+            if (warp->simt_depth >= GPGPU_SIMT_STACK_DEPTH) {
+                qemu_log_mask(LOG_GUEST_ERROR, "gpgpu_core: SIMT stack overflow\n");
+                return -1;
+            }
+            int32_t imm = imm_B(inst);
+            uint32_t then_pc = curr_pc + imm;
+            uint32_t else_pc = curr_pc + 4;
+
+            GPGPUSIMTEntry *entry = &warp->simt_stack[warp->simt_depth++];
+            entry->saved_mask    = warp->active_mask;
+            entry->then_mask     = then_mask;
+            entry->else_mask     = else_mask;
+            entry->then_pc       = then_pc;
+            entry->else_pc       = else_pc;
+            entry->reconverge_pc = then_pc < curr_pc ? else_pc : then_pc; /* forward: then_pc, backward: else_pc */
+            entry->then_done     = false;
+
+            /* Enter then path */
+            warp->active_mask = then_mask;
+            next_pc = then_pc;
+            qemu_log("SIMT: divergence push then=%08x else=%08x "
+                     "reconv=0x%x pc=0x%x\n",
+                     entry->then_mask, entry->else_mask,
+                     entry->reconverge_pc, next_pc);
+        } else {
+            /* Normal branch or no branch */
+            if (opcode == 0x63 && (then_mask || else_mask)) {
+                /* Uniform branch (all lanes agree) */
+                branch_taken = (then_mask != 0);
+                branch_target = (then_mask != 0) ? (curr_pc + imm_B(inst)) : (curr_pc + 4);
+            }
+            next_pc = branch_taken ? branch_target : (curr_pc + 4);
+        }
+
+pc_update:
+        /* Update warp PC for all lanes */
         for (int i = 0; i < GPGPU_WARP_SIZE; i++) {
             if (warp->lanes[i].active) {
                 warp->lanes[i].pc = next_pc;

@@ -993,9 +993,9 @@ static const uint32_t vec_add_kernel[] = {
 
 /* relu.kernel.bin: C[tid] = max(0, A[tid]) */
 static const uint32_t relu_kernel[] = {
-    0xF14022F3, 0x01F2F293, 0x02C2F263, 0x00229293,
-    0x00550333, 0x00558E33, 0x00032E83, 0x41FEDF13,
-    0xFFFF4F13, 0x01EEFEB3, 0x01DE2023, 0x00100073,
+    0xF14022F3, 0x01F2F293, 0x02C2F063, 0x00229293,
+    0x00550333, 0x00558E33, 0x00032E83, 0x000ED463,
+    0x00000E93, 0x01DE2023, 0x00100073,
 };
 
 /* matmul.kernel.bin: 4x4 matrix multiply C = A * B (tests MUL instruction) */
@@ -1110,8 +1110,8 @@ static void gpgpu_test_relu(void *obj, void *data, QGuestAllocator *alloc)
     qpci_io_writel(pdev, bar2, 0x00F0 + 1 * 4, 0x00003000);  /* C_base */
     qpci_io_writel(pdev, bar2, 0x00F0 + 2 * 4, n);            /* N */
 
-    /* Input A: {10, -8, 6, -4, 2, 0, -2, 4}  (混合正负数, ReLU = {10, 0, 6, 0, 2, 0, 0, 4}) */
-    int32_t input[] = {10, -8, 6, -4, 2, 0, -2, 4};
+    /* Input A: {-5, -3, -1, 0, 1, 3, 5, 7} (ReLU = {0, 0, 0, 0, 1, 3, 5, 7}) */
+    int32_t input[] = {-5, -3, -1, 0, 1, 3, 5, 7};
     for (uint32_t i = 0; i < n; i++) {
         qpci_io_writel(pdev, bar2, 0x1000 + i * 4, (uint32_t)input[i]);
     }
@@ -1138,8 +1138,8 @@ static void gpgpu_test_relu(void *obj, void *data, QGuestAllocator *alloc)
     val = qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS);
     g_assert_cmpuint(val & GPGPU_STATUS_READY, ==, GPGPU_STATUS_READY);
 
-    /* Expected: {10, 0, 6, 0, 2, 0, 0, 4} */
-    uint32_t expected[] = {10, 0, 6, 0, 2, 0, 0, 4};
+    /* Expected: {0, 0, 0, 0, 1, 3, 5, 7} */
+    uint32_t expected[] = {0, 0, 0, 0, 1, 3, 5, 7};
     for (uint32_t i = 0; i < n; i++) {
         val = qpci_io_readl(pdev, bar2, 0x3000 + i * 4);
         g_assert_cmpuint(val, ==, expected[i]);

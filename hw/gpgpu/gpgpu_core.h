@@ -28,6 +28,9 @@ typedef struct GPGPUState GPGPUState;
 #define GPGPU_NUM_REGS      32      /* RISC-V 通用寄存器数量 */
 #define GPGPU_NUM_FREGS     32      /* RISC-V 浮点寄存器数量 */
 
+/* SIMT Stack 深度 */
+#define GPGPU_SIMT_STACK_DEPTH  16
+
 /* 浮点 CSR 地址 */
 #define CSR_FFLAGS          0x001
 #define CSR_FRM             0x002
@@ -76,16 +79,37 @@ typedef struct GPGPULane {
 
 /*
  * ============================================================================
+ * SIMT Stack 条目
+ * ============================================================================
+ * 管理分支发散：一条共享 PC + 活跃掩码
+ * 发散时压栈，两路串行执行，汇合时弹栈
+ */
+typedef struct GPGPUSIMTEntry {
+    uint32_t saved_mask;        /* 发散前的完整掩码 */
+    uint32_t then_mask;         /* 走 then 路径的 lane */
+    uint32_t else_mask;         /* 走 else 路径的 lane */
+    uint32_t then_pc;           /* then 路径入口 (branch target) */
+    uint32_t else_pc;           /* else 路径入口 (fallthrough = pc+4) */
+    uint32_t reconverge_pc;     /* 两路汇合点 */
+    bool     then_done;         /* then 路径已执行完? */
+} GPGPUSIMTEntry;
+
+/*
+ * ============================================================================
  * Warp 状态结构
  * ============================================================================
- * 一个 Warp 包含 32 个 Lane，它们锁步执行同一条指令
+ * 一个 Warp 包含 32 个 Lane，它们通过 SIMT Stack 实现锁步 + 发散执行
  */
 typedef struct GPGPUWarp {
-    GPGPULane lanes[GPGPU_WARP_SIZE];   /* 32 个 lane */
-    uint32_t active_mask;                /* 活跃掩码，每位代表一个 lane */
-    uint32_t thread_id_base;             /* 这个 warp 的起始 thread_id */
-    uint32_t warp_id;                    /* warp 在 block 内的编号 */
-    uint32_t block_id[3];                /* 所属 block 的 ID */
+    GPGPULane lanes[GPGPU_WARP_SIZE];       /* 32 个 lane */
+    uint32_t active_mask;                    /* 当前活跃 lane 掩码 */
+    uint32_t thread_id_base;                 /* 这个 warp 的起始 thread_id */
+    uint32_t warp_id;                        /* warp 在 block 内的编号 */
+    uint32_t block_id[3];                    /* 所属 block 的 ID */
+
+    /* SIMT Stack for divergent branching */
+    GPGPUSIMTEntry simt_stack[GPGPU_SIMT_STACK_DEPTH];
+    int             simt_depth;
 } GPGPUWarp;
 
 /*
