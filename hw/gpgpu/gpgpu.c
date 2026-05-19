@@ -23,6 +23,9 @@
 #include "gpgpu_core.h"
 
 /* TODO: Implement MMIO control register read */
+/* Forward declarations */
+static void gpgpu_dma_complete(void *opaque);
+
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
     GPGPUState *s = GPGPU(opaque);
@@ -166,6 +169,10 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPGPU_REG_DMA_CTRL:
         s->dma.ctrl = val;
+        if (val & GPGPU_DMA_START) {
+            s->dma.status = GPGPU_DMA_BUSY;
+            gpgpu_dma_complete(s);
+        }
         break;
     case GPGPU_REG_THREAD_ID_X:
         s->simt.thread_id[0] = val;
@@ -298,10 +305,28 @@ static const MemoryRegionOps gpgpu_doorbell_ops = {
     },
 };
 
-/* TODO: Implement DMA completion handler */
 static void gpgpu_dma_complete(void *opaque)
 {
-    (void)opaque;
+    GPGPUState *s = GPGPU(opaque);
+    uint32_t src = (uint32_t)s->dma.src_addr;
+    uint32_t dst = (uint32_t)s->dma.dst_addr;
+    uint32_t size = s->dma.size;
+
+    /* Perform VRAM-to-VRAM memcpy with bounds checking */
+    if (src + size <= s->vram_size && dst + size <= s->vram_size) {
+        memmove(s->vram_ptr + dst, s->vram_ptr + src, size);
+        s->dma.status = GPGPU_DMA_COMPLETE;
+    } else {
+        s->dma.status = GPGPU_DMA_ERROR;
+        s->error_status |= GPGPU_ERR_DMA_FAULT;
+    }
+
+    s->dma.ctrl &= ~GPGPU_DMA_START;
+
+    if (s->dma.ctrl & GPGPU_DMA_IRQ_ENABLE) {
+        s->irq_status |= GPGPU_IRQ_DMA_DONE;
+        msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_DMA);
+    }
 }
 
 /* TODO: Implement kernel completion handler */

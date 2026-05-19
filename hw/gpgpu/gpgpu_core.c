@@ -117,7 +117,9 @@ static uint32_t float32_to_e2m1(uint32_t val)
 void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
                           uint32_t thread_id_base, const uint32_t block_id[3],
                           uint32_t num_threads,
-                          uint32_t warp_id, uint32_t block_id_linear)
+                          uint32_t warp_id, uint32_t block_id_linear,
+                          const uint32_t *kernel_args,
+                          uint32_t num_kernel_args)
 {
     memset(warp, 0, sizeof(*warp));
     warp->warp_id = warp_id;
@@ -131,6 +133,11 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
         lane->active = (i < num_threads);
         lane->pc = pc;
         lane->mhartid = MHARTID_ENCODE(block_id_linear, warp_id, i);
+
+        /* 将内核参数写入 a0-a7 (gpr[10..17]) */
+        for (uint32_t k = 0; k < num_kernel_args && k < 8; k++) {
+            lane->gpr[10 + k] = kernel_args[k];
+        }
     }
 
     warp->active_mask = (num_threads >= 32) ?
@@ -190,27 +197,78 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 break;
             }
 
-            /* OP: rd = rs1 op rs2 */
+            /* OP: rd = rs1 op rs2 (RV32I + M extension) */
             case 0x33: {
                 uint32_t v1 = lane->gpr[rs1];
                 uint32_t v2 = lane->gpr[rs2];
-                switch (funct3) {
-                case 0: /* ADD/SUB/MUL */
-                    if (funct7 == 0x00)
-                        lane->gpr[rd] = (int32_t)v1 + (int32_t)v2;
-                    else if (funct7 == 0x20)
-                        lane->gpr[rd] = (int32_t)v1 - (int32_t)v2;
-                    break;
-                case 1: lane->gpr[rd] = v1 << (v2 & 0x1F); break;   /* SLL */
-                case 2: lane->gpr[rd] = (int32_t)v1 < (int32_t)v2; break; /* SLT */
-                case 3: lane->gpr[rd] = v1 < v2; break;              /* SLTU */
-                case 4: lane->gpr[rd] = v1 ^ v2; break;              /* XOR */
-                case 5: /* SRL/SRA */
-                    if (funct7 & 0x20) lane->gpr[rd] = (int32_t)v1 >> (v2 & 0x1F);
-                    else              lane->gpr[rd] = v1 >> (v2 & 0x1F);
-                    break;
-                case 6: lane->gpr[rd] = v1 | v2; break;              /* OR */
-                case 7: lane->gpr[rd] = v1 & v2; break;              /* AND */
+                if (funct7 == 0x01) {
+                    /* M extension: funct7=0x01 */
+                    int64_t prod;
+                    switch (funct3) {
+                    case 0: /* MUL */
+                        lane->gpr[rd] = (int64_t)(int32_t)v1 * (int64_t)(int32_t)v2;
+                        break;
+                    case 1: /* MULH */
+                        prod = (int64_t)(int32_t)v1 * (int64_t)(int32_t)v2;
+                        lane->gpr[rd] = (uint64_t)prod >> 32;
+                        break;
+                    case 2: /* MULHSU */
+                        prod = (int64_t)(int32_t)v1 * (uint64_t)v2;
+                        lane->gpr[rd] = (uint64_t)prod >> 32;
+                        break;
+                    case 3: /* MULHU */
+                        prod = (uint64_t)v1 * (uint64_t)v2;
+                        lane->gpr[rd] = (uint64_t)prod >> 32;
+                        break;
+                    case 4: /* DIV */
+                        if (v2 == 0)
+                            lane->gpr[rd] = 0xFFFFFFFF;
+                        else if ((int32_t)v1 == INT32_MIN && (int32_t)v2 == -1)
+                            lane->gpr[rd] = v1;
+                        else
+                            lane->gpr[rd] = (int32_t)v1 / (int32_t)v2;
+                        break;
+                    case 5: /* DIVU */
+                        if (v2 == 0)
+                            lane->gpr[rd] = 0xFFFFFFFF;
+                        else
+                            lane->gpr[rd] = v1 / v2;
+                        break;
+                    case 6: /* REM */
+                        if (v2 == 0)
+                            lane->gpr[rd] = v1;
+                        else if ((int32_t)v1 == INT32_MIN && (int32_t)v2 == -1)
+                            lane->gpr[rd] = 0;
+                        else
+                            lane->gpr[rd] = (int32_t)v1 % (int32_t)v2;
+                        break;
+                    case 7: /* REMU */
+                        if (v2 == 0)
+                            lane->gpr[rd] = v1;
+                        else
+                            lane->gpr[rd] = v1 % v2;
+                        break;
+                    }
+                } else {
+                    /* RV32I ALU operations */
+                    switch (funct3) {
+                    case 0: /* ADD/SUB */
+                        if (funct7 == 0x00)
+                            lane->gpr[rd] = (int32_t)v1 + (int32_t)v2;
+                        else if (funct7 == 0x20)
+                            lane->gpr[rd] = (int32_t)v1 - (int32_t)v2;
+                        break;
+                    case 1: lane->gpr[rd] = v1 << (v2 & 0x1F); break;   /* SLL */
+                    case 2: lane->gpr[rd] = (int32_t)v1 < (int32_t)v2; break; /* SLT */
+                    case 3: lane->gpr[rd] = v1 < v2; break;              /* SLTU */
+                    case 4: lane->gpr[rd] = v1 ^ v2; break;              /* XOR */
+                    case 5: /* SRL/SRA */
+                        if (funct7 & 0x20) lane->gpr[rd] = (int32_t)v1 >> (v2 & 0x1F);
+                        else              lane->gpr[rd] = v1 >> (v2 & 0x1F);
+                        break;
+                    case 6: lane->gpr[rd] = v1 | v2; break;              /* OR */
+                    case 7: lane->gpr[rd] = v1 & v2; break;              /* AND */
+                    }
                 }
                 break;
             }
@@ -446,6 +504,17 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
     int num_warps = (threads_per_block + 31) / 32;
     int block_linear = 0;
 
+    /* 从 VRAM 读取内核参数 (最多 8 个 u32) */
+    uint32_t kernel_args[8] = {0};
+    uint32_t num_args = 0;
+    if (s->kernel.kernel_args != 0) {
+        for (int i = 0; i < 8; i++) {
+            uint32_t addr = (uint32_t)s->kernel.kernel_args + i * 4;
+            kernel_args[i] = vram_readl(s, addr);
+            num_args++;
+        }
+    }
+
     for (int bx = 0; bx < s->kernel.grid_dim[0]; bx++) {
         for (int by = 0; by < s->kernel.grid_dim[1]; by++) {
             for (int bz = 0; bz < s->kernel.grid_dim[2]; bz++) {
@@ -460,7 +529,8 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
                     gpgpu_core_init_warp(&warp,
                         (uint32_t)s->kernel.kernel_addr,
                         thread_id_base, block_id,
-                        num_active, w, block_linear);
+                        num_active, w, block_linear,
+                        kernel_args, num_args);
 
                     gpgpu_core_exec_warp(s, &warp, 4096);
                 }

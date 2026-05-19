@@ -73,6 +73,8 @@
 /* 内核地址寄存器 */
 #define GPGPU_REG_KERNEL_ADDR_LO    0x0300
 #define GPGPU_REG_KERNEL_ADDR_HI    0x0304
+#define GPGPU_REG_KERNEL_ARGS_LO    0x0308
+#define GPGPU_REG_KERNEL_ARGS_HI    0x030C
 #define GPGPU_REG_DISPATCH          0x0330
 
 /* 寄存器位定义 */
@@ -969,6 +971,307 @@ static void gpgpu_test_lp_convert_saturate(void *obj, void *data,
     qpci_iounmap(pdev, bar2);
 }
 
+/*
+ * ============================================================================
+ * 集成测试: M 扩展, 内核参数传递, vec_add, ReLU, 矩阵乘
+ * ============================================================================
+ *
+ * 每个测试的 VRAM 布局:
+ *   0x0000: kernel 代码
+ *   0x00F0: kernel 参数 (4 个 u32)
+ *   0x1000: 输入 A
+ *   0x2000: 输入 B
+ *   0x3000: 输出 C
+ */
+
+/* vec_add.kernel.bin: C[tid] = A[tid] + B[tid] */
+static const uint32_t vec_add_kernel[] = {
+    0xF14022F3, 0x01F2F293, 0x02D2F263, 0x00229293,
+    0x00550333, 0x00032E83, 0x005583B3, 0x0003AF03,
+    0x00560E33, 0x01EE8FB3, 0x01FE2023, 0x00100073,
+};
+
+/* relu.kernel.bin: C[tid] = max(0, A[tid]) */
+static const uint32_t relu_kernel[] = {
+    0xF14022F3, 0x01F2F293, 0x02C2F263, 0x00229293,
+    0x00550333, 0x00558E33, 0x00032E83, 0x41FEDF13,
+    0xFFFF4F13, 0x01EEFEB3, 0x01DE2023, 0x00100073,
+};
+
+/* matmul.kernel.bin: 4x4 matrix multiply C = A * B (tests MUL instruction) */
+static const uint32_t matmul_kernel[] = {
+    0xF14022F3, 0x01F2F293, 0x01000F13, 0x01E2E463,
+    0x06000063, 0x0022D313, 0x0032F393, 0x00000F93,
+    0x00000E13, 0x00231E93, 0x01CE8EB3, 0x002E9E93,
+    0x01D50EB3, 0x000EAE83, 0x002E1F13, 0x007F0F33,
+    0x002F1F13, 0x01E58F33, 0x000F2F03, 0x03EE8EB3,
+    0x01DF8FB3, 0x001E0E13, 0xFCDE46E3, 0x00231E93,
+    0x007E8EB3, 0x002E9E93, 0x01D60EB3, 0x01FEA023,
+    0x00100073,
+};
+
+/*
+ * gpgpu_test_vec_add - 集成测试: 矢量加法
+ * 验证: 内核参数传递 + 基本运算 + Host↔VRAM 数据链路
+ */
+static void gpgpu_test_vec_add(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0, bar2;
+    uint32_t val;
+    uint32_t n = 8;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+
+    /* Upload kernel to VRAM 0x0000 */
+    for (size_t i = 0; i < ARRAY_SIZE(vec_add_kernel); i++) {
+        qpci_io_writel(pdev, bar2, i * 4, vec_add_kernel[i]);
+    }
+
+    /* Write kernel args to VRAM 0x00F0: {A_base, B_base, C_base, N} */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 0 * 4, 0x00001000);  /* A_base */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 1 * 4, 0x00002000);  /* B_base */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 2 * 4, 0x00003000);  /* C_base */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 3 * 4, n);            /* N */
+
+    /* Write input A at 0x1000: {10, -20, 30, -40, 50, -60, 70, -80} */
+    int32_t a_data[] = {10, -20, 30, -40, 50, -60, 70, -80};
+    int32_t b_data[] = {1, -2, 3, -4, 5, -6, 7, -8};
+    for (uint32_t i = 0; i < n; i++) {
+        qpci_io_writel(pdev, bar2, 0x1000 + i * 4, (uint32_t)a_data[i]);
+        qpci_io_writel(pdev, bar2, 0x2000 + i * 4, (uint32_t)b_data[i]);
+    }
+
+    /* Zero output at 0x3000 */
+    for (uint32_t i = 0; i < n; i++) {
+        qpci_io_writel(pdev, bar2, 0x3000 + i * 4, 0);
+    }
+
+    /* Configure kernel */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_LO, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_HI, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_LO, 0x000000F0);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_HI, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_X, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Z, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_X, n);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Z, 1);
+
+    /* Dispatch */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+
+    /* Verify completion */
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS);
+    g_assert_cmpuint(val & GPGPU_STATUS_READY, ==, GPGPU_STATUS_READY);
+
+    /* Verify C[i] == A[i] + B[i] */
+    int32_t expected_ab[] = {11, -22, 33, -44, 55, -66, 77, -88};
+    for (uint32_t i = 0; i < n; i++) {
+        val = qpci_io_readl(pdev, bar2, 0x3000 + i * 4);
+        g_assert_cmpuint(val, ==, (uint32_t)expected_ab[i]);
+    }
+
+    qpci_iounmap(pdev, bar0);
+    qpci_iounmap(pdev, bar2);
+}
+
+/*
+ * gpgpu_test_relu - 集成测试: ReLU
+ * 验证: 条件分支 (bge) + 内核参数 + 负数处理
+ */
+static void gpgpu_test_relu(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0, bar2;
+    uint32_t val;
+    uint32_t n = 8;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+
+    /* Upload kernel */
+    for (size_t i = 0; i < ARRAY_SIZE(relu_kernel); i++) {
+        qpci_io_writel(pdev, bar2, i * 4, relu_kernel[i]);
+    }
+
+    /* Args: {A_base, C_base, N} */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 0 * 4, 0x00001000);  /* A_base */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 1 * 4, 0x00003000);  /* C_base */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 2 * 4, n);            /* N */
+
+    /* Input A: {10, -8, 6, -4, 2, 0, -2, 4}  (混合正负数, ReLU = {10, 0, 6, 0, 2, 0, 0, 4}) */
+    int32_t input[] = {10, -8, 6, -4, 2, 0, -2, 4};
+    for (uint32_t i = 0; i < n; i++) {
+        qpci_io_writel(pdev, bar2, 0x1000 + i * 4, (uint32_t)input[i]);
+    }
+
+    /* Zero output */
+    for (uint32_t i = 0; i < n; i++) {
+        qpci_io_writel(pdev, bar2, 0x3000 + i * 4, 0xDEADBEEF);
+    }
+
+    /* Configure */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_LO, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_HI, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_LO, 0x000000F0);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_HI, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_X, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Z, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_X, n);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Z, 1);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS);
+    g_assert_cmpuint(val & GPGPU_STATUS_READY, ==, GPGPU_STATUS_READY);
+
+    /* Expected: {10, 0, 6, 0, 2, 0, 0, 4} */
+    uint32_t expected[] = {10, 0, 6, 0, 2, 0, 0, 4};
+    for (uint32_t i = 0; i < n; i++) {
+        val = qpci_io_readl(pdev, bar2, 0x3000 + i * 4);
+        g_assert_cmpuint(val, ==, expected[i]);
+    }
+
+    qpci_iounmap(pdev, bar0);
+    qpci_iounmap(pdev, bar2);
+}
+
+/*
+ * gpgpu_test_matmul - 集成测试: 4x4 矩阵乘
+ * 验证: MUL 指令 + 三维内核参数 + 多层循环
+ */
+static void gpgpu_test_matmul(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0, bar2;
+    uint32_t val;
+    uint32_t n = 16; /* only 16 threads needed for 4x4 */
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+
+    /* Upload kernel */
+    for (size_t i = 0; i < ARRAY_SIZE(matmul_kernel); i++) {
+        qpci_io_writel(pdev, bar2, i * 4, matmul_kernel[i]);
+    }
+
+    /* Args: {A_base, B_base, C_base, K(=4)} */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 0 * 4, 0x00001000);  /* A_base */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 1 * 4, 0x00002000);  /* B_base */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 2 * 4, 0x00003000);  /* C_base */
+    qpci_io_writel(pdev, bar2, 0x00F0 + 3 * 4, 4);            /* K = 4 */
+
+    /* Matrix A (4x4) at 0x1000: {1,2,3,4, 5,6,7,8, 9,10,11,12, 13,14,15,16} */
+    for (uint32_t i = 0; i < 16; i++) {
+        qpci_io_writel(pdev, bar2, 0x1000 + i * 4, (int32_t)(i + 1));
+    }
+
+    /* Matrix B (4x4) at 0x2000: identity matrix */
+    for (uint32_t i = 0; i < 4; i++) {
+        for (uint32_t j = 0; j < 4; j++) {
+            qpci_io_writel(pdev, bar2, 0x2000 + (i * 4 + j) * 4,
+                           (i == j) ? 1 : 0);
+        }
+    }
+
+    /* Zero output */
+    for (uint32_t i = 0; i < 16; i++) {
+        qpci_io_writel(pdev, bar2, 0x3000 + i * 4, 0);
+    }
+
+    /* Configure */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_LO, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_HI, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_LO, 0x000000F0);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_HI, 0x00000000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_X, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Z, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_X, n);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Z, 1);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS);
+    g_assert_cmpuint(val & GPGPU_STATUS_READY, ==, GPGPU_STATUS_READY);
+
+    /* Verify: C = A * I = A (identity matrix B means C should equal A) */
+    for (uint32_t i = 0; i < 16; i++) {
+        val = qpci_io_readl(pdev, bar2, 0x3000 + i * 4);
+        g_assert_cmpuint(val, ==, (uint32_t)(i + 1));
+    }
+
+    qpci_iounmap(pdev, bar0);
+    qpci_iounmap(pdev, bar2);
+}
+
+/*
+ * gpgpu_test_dma_transfer - 集成测试: DMA 引擎
+ * 验证: DMA 传输完成 + 数据完整性
+ */
+static void gpgpu_test_dma_transfer(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0, bar2;
+    uint32_t val;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+
+    /* Write source data at VRAM 0x1000 */
+    qpci_io_writel(pdev, bar2, 0x1000, 0xAABBCCDD);
+    qpci_io_writel(pdev, bar2, 0x1004, 0x11223344);
+
+    /* Configure DMA: SRC=0x1000, DST=0x2000, SIZE=8 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_SRC_LO, 0x1000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_SRC_HI, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_DST_LO, 0x2000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_DST_HI, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_SIZE, 8);
+
+    /* Trigger DMA (GPGPU_DMA_START = 1) */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_CTRL, 1);
+
+    /* Wait for DMA completion with timeout */
+    int dma_retries = 10000;
+    do {
+        val = qpci_io_readl(pdev, bar0, GPGPU_REG_DMA_STATUS);
+        if (--dma_retries <= 0) break;
+    } while ((val & 2) == 0); /* bit 1 = COMPLETE */
+    g_assert_cmpuint(val & 2, ==, 2);
+
+    /* Verify data at destination */
+    val = qpci_io_readl(pdev, bar2, 0x2000);
+    g_assert_cmpuint(val, ==, 0xAABBCCDD);
+    val = qpci_io_readl(pdev, bar2, 0x2004);
+    g_assert_cmpuint(val, ==, 0x11223344);
+
+    qpci_iounmap(pdev, bar0);
+    qpci_iounmap(pdev, bar2);
+}
+
 static void gpgpu_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -1010,6 +1313,12 @@ static void gpgpu_register_nodes(void)
                  gpgpu_test_lp_convert_e5m2_e2m1, NULL);
     qos_add_test("lp-convert-saturate", "gpgpu",
                  gpgpu_test_lp_convert_saturate, NULL);
+
+    /* 集成测试 */
+    qos_add_test("vec-add", "gpgpu", gpgpu_test_vec_add, NULL);
+    qos_add_test("relu", "gpgpu", gpgpu_test_relu, NULL);
+    qos_add_test("matmul", "gpgpu", gpgpu_test_matmul, NULL);
+    qos_add_test("dma-transfer", "gpgpu", gpgpu_test_dma_transfer, NULL);
 }
 
 libqos_init(gpgpu_register_nodes);
