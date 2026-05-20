@@ -278,6 +278,15 @@ struct GPGPUState {
 
     /*-- SIMT 执行上下文 (CTRL 设备) --*/
     GPGPUSIMTContext simt;          /* 当前线程的执行上下文 */
+
+    /*-- CFG 分析: kernel 加载时计算的真实汇合点表 --*/
+    /*
+     * 记录每个 branch 指令的真实 immediate post-dominator (IPOST) 地址。
+     * 在 gpgpu_core_exec_kernel() 中构建，pop 时使用 reconv_pc + 4 跳过。
+     */
+    uint32_t *branch_pcs;           /* branch 指令 PC 数组 */
+    uint32_t *reconv_pcs;           /* 对应的汇合点 PC 数组 */
+    int       num_branches;         /* 数组长度 */
 };
 
 #endif /* HW_GPGPU_H */

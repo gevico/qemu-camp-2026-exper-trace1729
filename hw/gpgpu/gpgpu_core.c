@@ -46,6 +46,297 @@ static int32_t imm_S(uint32_t inst) { return SEXT((BITS(inst, 31, 25) << 5) | BI
 static int32_t imm_B(uint32_t inst) { return SEXT((BITS(inst, 31, 31) << 11 | BITS(inst, 7, 7) << 10 | BITS(inst, 30, 25) << 4 | BITS(inst, 11, 8)), 12) << 1; }
 static int32_t imm_J(uint32_t inst) { return SEXT((BITS(inst, 31, 31) << 19 | BITS(inst, 19, 12) << 11 | BITS(inst, 20, 20) << 10 | BITS(inst, 30, 21)), 20) << 1; }
 
+/*
+ * ============================================================================
+ * CFG Post-Dominator Analysis (kernel 加载时执行一次)
+ * ============================================================================
+ * 扫描 kernel 二进制，为每个 branch 指令计算 immediate post-dominator (IPOST)。
+ * IPOST 是真实汇合点，取代 then_pc < curr_pc ? else_pc : then_pc 启发式。
+ *
+ * 算法:
+ *   1. 从 kernel_addr 出发做可达性扫描, 构建 CFG (前驱/后继)
+ *   2. 用迭代数据流法计算 post-dominiator: PD[n] = {n} ∪ (∩ PD[s])
+ *   3. 每个 branch 的 IPOST = 在 PD[n] - {n} 中后支配所有其它候选者的节点
+ * ============================================================================
+ */
+
+#define CFG_MAX_NODES  1024  /* 最大 4KB kernel (1024 条指令) */
+#define CFG_NIL        0xFFFF
+
+/* CFG 节点: 一个指令地址 */
+typedef struct {
+    uint32_t pc;                    /* 指令地址 (相对于 kernel_addr 的偏移) */
+    uint16_t succ[2];              /* 后继节点索引 (最多 2 个) */
+    uint8_t  num_succ;
+    bool     is_branch;            /* 是 branch 指令 (需要计算 IPOST) */
+} CFGNode;
+
+/*
+ * gpgpu_core_build_cfg - 构建 kernel 的 CFG 并计算 IPOST
+ * @s: GPGPU 设备状态
+ * @kernel_addr: kernel 在 VRAM 中的地址
+ *
+ * 结果写入 s->branch_pcs / s->reconv_pcs / s->num_branches
+ * 所有分配的数组后续由 gpgpu_core_free_cfg 释放
+ */
+static void gpgpu_core_build_cfg(GPGPUState *s, uint32_t kernel_addr)
+{
+    CFGNode nodes[CFG_MAX_NODES];
+    int nnodes = 0;
+    int exit_idx = -1;
+
+    /*
+     * 第一遍: 用 worklist 做可达性分析
+     * 从 kernel_addr 开始，沿着控制流边扩散
+     */
+    bool visited[CFG_MAX_NODES] = {false};
+
+    /* worklist */
+    uint32_t wl_pc[CFG_MAX_NODES];
+    int wl_head = 0, wl_tail = 0;
+    wl_pc[wl_tail++] = kernel_addr;
+
+    while (wl_head < wl_tail) {
+        uint32_t pc = wl_pc[wl_head++];
+        int idx = (pc - kernel_addr) / 4;
+        if (idx < 0 || idx >= CFG_MAX_NODES) continue;
+        if (visited[idx]) continue;
+
+        visited[idx] = true;
+        nodes[idx].pc = pc;
+        nodes[idx].num_succ = 0;
+        nodes[idx].is_branch = false;
+
+        uint32_t inst = vram_readl(s, pc);
+        uint8_t opcode = BITS(inst, 6, 0);
+
+        if (inst == 0x00100073) {
+            /* ebreak: exit node, no successors */
+            nodes[idx].num_succ = 0;
+            exit_idx = idx;
+            nnodes++;
+            continue;
+        }
+
+        if (opcode == 0x63) {
+            /* B-type branch */
+            int32_t imm = imm_B(inst);
+            uint32_t then_pc = pc + imm;
+            uint32_t else_pc = pc + 4;
+            nodes[idx].is_branch = true;
+            nodes[idx].succ[0] = (else_pc - kernel_addr) / 4;
+            nodes[idx].succ[1] = (then_pc - kernel_addr) / 4;
+            nodes[idx].num_succ = 2;
+        } else if (opcode == 0x6F) {
+            /* JAL: unconditional jump */
+            int32_t imm = imm_J(inst);
+            uint32_t target = pc + imm;
+            nodes[idx].succ[0] = (target - kernel_addr) / 4;
+            nodes[idx].num_succ = 1;
+        } else {
+            /* Fall-through (包括 JALR / CSR, 保守处理) */
+            nodes[idx].succ[0] = (pc + 4 - kernel_addr) / 4;
+            nodes[idx].num_succ = 1;
+        }
+
+        /* 将未访问的后继加入 worklist */
+        for (int si = 0; si < nodes[idx].num_succ; si++) {
+            int sidx = nodes[idx].succ[si];
+            if (sidx >= 0 && sidx < CFG_MAX_NODES && !visited[sidx]) {
+                wl_pc[wl_tail++] = kernel_addr + sidx * 4;
+                if (wl_tail > CFG_MAX_NODES) wl_tail = CFG_MAX_NODES;
+            }
+        }
+        nnodes++;
+    }
+
+    /*
+     * 第二遍: 迭代数据流求 post-dominator (PD)
+     * PD[n] = {n} ∪ (∩_{s∈succ[n]} PD[s])
+     * 用 128-bit 的位图表示 (CFG_MAX_NODES=1024 → 16 个 uint64)
+     */
+    uint64_t pd[CFG_MAX_NODES][16];   /* PD 位图 */
+    uint64_t all_nodes[16] = {0};
+
+    for (int i = 0; i < nnodes; i++) {
+        int bit = i / 64;
+        int off = i % 64;
+        all_nodes[bit] |= (1ULL << off);
+    }
+
+    /* 初始化: PD[exit] = {exit}, PD[others] = all nodes */
+    for (int i = 0; i < CFG_MAX_NODES; i++) {
+        if (!visited[i]) continue;
+        for (int b = 0; b < 16; b++) {
+            pd[i][b] = all_nodes[b];
+        }
+    }
+    if (exit_idx >= 0) {
+        memset(pd[exit_idx], 0, sizeof(pd[0]));
+        int bit = exit_idx / 64;
+        int off = exit_idx % 64;
+        pd[exit_idx][bit] = (1ULL << off);
+    }
+
+    /* 迭代直到稳定 */
+    bool changed = true;
+    int iterations = 0;
+    while (changed && iterations < 100) {
+        changed = false;
+        iterations++;
+        for (int i = 0; i < CFG_MAX_NODES; i++) {
+            if (!visited[i]) continue;
+            if (i == exit_idx) continue;
+
+            /* ∩ PD[s] */
+            if (nodes[i].num_succ == 0) {
+                continue;  /* dead end, keep initialization */
+            }
+
+            uint64_t intersect[16];
+            memcpy(intersect, pd[nodes[i].succ[0]], sizeof(intersect));
+            for (int si = 1; si < nodes[i].num_succ; si++) {
+                int sidx = nodes[i].succ[si];
+                if (sidx >= 0 && sidx < CFG_MAX_NODES && visited[sidx]) {
+                    for (int b = 0; b < 16; b++) {
+                        intersect[b] &= pd[sidx][b];
+                    }
+                }
+            }
+
+            /* {i} ∪ intersect */
+            uint64_t new_pd[16];
+            memcpy(new_pd, intersect, sizeof(new_pd));
+            int bit = i / 64;
+            int off = i % 64;
+            new_pd[bit] |= (1ULL << off);
+
+            /* 比较 */
+            for (int b = 0; b < 16; b++) {
+                if (new_pd[b] != pd[i][b]) {
+                    changed = true;
+                    pd[i][b] = new_pd[b];
+                }
+            }
+        }
+    }
+
+    /*
+     * 第三遍: 对每个 branch 计算 IPOST
+     * IPOST[n] = d ∈ PD[n]-{n}, 且对于所有 p ∈ PD[n]-{n,d}: d ∈ PD[p]
+     * 即 d 是 PD 集合中最靠近 n 的那个节点
+     */
+    /* 先统计 branch 数量 */
+    int num_branches = 0;
+    for (int i = 0; i < CFG_MAX_NODES; i++) {
+        if (visited[i] && nodes[i].is_branch) num_branches++;
+    }
+
+    s->branch_pcs  = g_new0(uint32_t, num_branches);
+    s->reconv_pcs  = g_new0(uint32_t, num_branches);
+    s->num_branches = 0;
+
+    for (int i = 0; i < CFG_MAX_NODES; i++) {
+        if (!visited[i] || !nodes[i].is_branch) continue;
+
+        /*
+         * 从 PD[i] 中找汇合点: 跳过同样是分支指令的节点.
+         * 按 PD 深度降序 (最近者优先), 选第一个非分支节点.
+         * 避免聚合点和分支指令重合导致的分叉丢失问题.
+         */
+        /* 先找出所有候选并按深度排序 */
+        int candidates[CFG_MAX_NODES];
+        int ncand = 0;
+        for (int j = 0; j < CFG_MAX_NODES; j++) {
+            if (!visited[j] || j == i) continue;
+            int bit = j / 64;
+            int off = j % 64;
+            if (!(pd[i][bit] & (1ULL << off))) continue;
+            candidates[ncand++] = j;
+        }
+
+        /* 简单选择排序: 按 PD 深度降序 */
+        for (int ci = 0; ci < ncand; ci++) {
+            /* 计算深度 */
+            int depth = 0;
+            for (int b = 0; b < 16; b++) {
+                depth += __builtin_popcountll(pd[candidates[ci]][b]);
+            }
+            /* 插入排序降序 */
+            int k = ci;
+            while (k > 0) {
+                int prev_depth = 0;
+                for (int b = 0; b < 16; b++) {
+                    prev_depth += __builtin_popcountll(pd[candidates[k-1]][b]);
+                }
+                if (prev_depth >= depth) break;
+                int tmp = candidates[k];
+                candidates[k] = candidates[k-1];
+                candidates[k-1] = tmp;
+                k--;
+            }
+        }
+
+        /* 选第一个非分支候选 */
+        int reconv_idx = -1;
+        for (int ci = 0; ci < ncand; ci++) {
+            if (!nodes[candidates[ci]].is_branch) {
+                reconv_idx = candidates[ci];
+                break;
+            }
+        }
+        /* 保底: 用最近候选 (即使是分支) */
+        if (reconv_idx < 0 && ncand > 0) {
+            reconv_idx = candidates[0];
+        }
+
+        if (reconv_idx >= 0) {
+            s->branch_pcs[s->num_branches]  = kernel_addr + i * 4;
+            s->reconv_pcs[s->num_branches++] = kernel_addr + reconv_idx * 4;
+        } else {
+            /* 无法确定 IPOST (例如无出口). 用启发式保底 */
+            uint32_t inst = vram_readl(s, kernel_addr + i * 4);
+            int32_t imm = imm_B(inst);
+            uint32_t then_pc = kernel_addr + i * 4 + imm;
+            uint32_t else_pc = kernel_addr + i * 4 + 4;
+            s->branch_pcs[s->num_branches]  = kernel_addr + i * 4;
+            s->reconv_pcs[s->num_branches++] = then_pc < kernel_addr + i * 4 ?
+                                               else_pc : then_pc;
+        }
+    }
+
+    /* 调试: 打印 IPOST 表 */
+    for (int i = 0; i < s->num_branches; i++) {
+        qemu_log("IPOST: branch=0x%x reconv=0x%x\n",
+                 s->branch_pcs[i], s->reconv_pcs[i]);
+    }
+}
+
+/*
+ * gpgpu_core_free_cfg - 释放 CFG 分析分配的内存
+ */
+static void gpgpu_core_free_cfg(GPGPUState *s)
+{
+    g_free(s->branch_pcs);
+    g_free(s->reconv_pcs);
+    s->branch_pcs  = NULL;
+    s->reconv_pcs  = NULL;
+    s->num_branches = 0;
+}
+
+/*
+ * gpgpu_core_lookup_reconv - 查表获取 branch PC 的 IPOST
+ */
+static uint32_t gpgpu_core_lookup_reconv(GPGPUState *s, uint32_t branch_pc)
+{
+    for (int i = 0; i < s->num_branches; i++) {
+        if (s->branch_pcs[i] == branch_pc) {
+            return s->reconv_pcs[i];
+        }
+    }
+    return 0;  /* not found */
+}
+
 /* LP conversion: quantize float32 → low-precision; reverse direction is identity */
 
 static uint32_t float32_to_bf16(uint32_t val)
@@ -472,8 +763,9 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 
         /* ------------------------------------------------------------------
          * SIMT Reconvergence Check (after instruction execution)
-         * If we just executed an instruction at the reconvergence point,
-         * switch to else path or pop the stack.
+         * With correct IPOST, both paths naturally flow through reconv_pc.
+         * First arrival: switch to the other path.
+         * Second arrival: cascade-pop all matching entries, skip to reconv+4.
          * ---------------------------------------------------------------- */
         uint32_t next_pc;
         if (warp->simt_depth > 0) {
@@ -484,9 +776,26 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                     warp->active_mask = top->else_mask;
                     next_pc = top->else_pc;
                 } else {
-                    warp->active_mask = top->saved_mask;
-                    next_pc = top->reconverge_pc;
-                    warp->simt_depth--;
+                    /*
+                     * Cascade pop: all entries whose reconv_pc == curr_pc
+                     * have both paths executed. Pop them at once,
+                     * accumulating saved_mask, and skip past reconv_pc
+                     * (already executed by the last path).
+                     */
+                    uint32_t acc_mask = 0;
+                    while (warp->simt_depth > 0) {
+                        GPGPUSIMTEntry *e =
+                            &warp->simt_stack[warp->simt_depth - 1];
+                        if (e->reconverge_pc != curr_pc) break;
+                        if (!e->then_done) break;
+                        acc_mask |= e->saved_mask; /* 渐进恢复掩码 */
+                        warp->simt_depth--;
+                    }
+                    if (acc_mask == 0) {
+                        acc_mask = top->saved_mask;  /* 至少原先遮罩 */
+                    }
+                    warp->active_mask = acc_mask;
+                    next_pc = curr_pc + 4;  /* 跳过已执行的聚合点指令 */
                 }
                 goto pc_update;
             }
@@ -499,39 +808,50 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
          *  - Otherwise: pc + 4
          */
         if (opcode == 0x63 && then_mask != 0 && else_mask != 0) {
-            /* Divergent branch: push SIMT stack */
-            if (warp->simt_depth >= GPGPU_SIMT_STACK_DEPTH) {
-                qemu_log_mask(LOG_GUEST_ERROR, "gpgpu_core: SIMT stack overflow\n");
-                return -1;
-            }
             int32_t imm = imm_B(inst);
             uint32_t then_pc = curr_pc + imm;
             uint32_t else_pc = curr_pc + 4;
+            if (then_pc != else_pc) {
+                /* Divergent branch: push SIMT stack */
+                if (warp->simt_depth >= GPGPU_SIMT_STACK_DEPTH) {
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                        "gpgpu_core: SIMT stack overflow\n");
+                    return -1;
+                }
 
-            GPGPUSIMTEntry *entry = &warp->simt_stack[warp->simt_depth++];
-            entry->saved_mask    = warp->active_mask;
-            entry->then_mask     = then_mask;
-            entry->else_mask     = else_mask;
-            entry->then_pc       = then_pc;
-            entry->else_pc       = else_pc;
-            entry->reconverge_pc = then_pc < curr_pc ? else_pc : then_pc;
-            entry->then_done     = false;
+                /* Look up correct reconv point from CFG analysis */
+                uint32_t reconv = gpgpu_core_lookup_reconv(s, curr_pc);
+                if (reconv == 0) {
+                    reconv = then_pc < curr_pc ? else_pc : then_pc;
+                }
 
-            /* Enter then path */
-            warp->active_mask = then_mask;
-            next_pc = then_pc;
-            qemu_log("SIMT: divergence push then=%08x else=%08x "
-                     "reconv=0x%x pc=0x%x\n",
-                     entry->then_mask, entry->else_mask,
-                     entry->reconverge_pc, next_pc);
-        } else {
-            /* Normal branch or no branch */
-            if (opcode == 0x63 && (then_mask || else_mask)) {
-                branch_taken = (then_mask != 0);
-                branch_target = (then_mask != 0) ? (curr_pc + imm_B(inst)) : (curr_pc + 4);
+                GPGPUSIMTEntry *entry = &warp->simt_stack[warp->simt_depth++];
+                entry->saved_mask    = warp->active_mask;
+                entry->then_mask     = then_mask;
+                entry->else_mask     = else_mask;
+                entry->then_pc       = then_pc;
+                entry->else_pc       = else_pc;
+                entry->reconverge_pc = reconv;
+                entry->then_done     = false;
+
+                /* Enter then path */
+                warp->active_mask = then_mask;
+                next_pc = then_pc;
+                qemu_log("SIMT: divergence push then=%08x else=%08x "
+                         "reconv=0x%x pc=0x%x\n",
+                         entry->then_mask, entry->else_mask,
+                         entry->reconverge_pc, next_pc);
+                goto pc_update;
             }
-            next_pc = branch_taken ? branch_target : (curr_pc + 4);
+            /* then_pc == else_pc: uniform branch, fall through to normal handling */
         }
+
+        /* Normal branch or no branch */
+        if (opcode == 0x63 && (then_mask || else_mask)) {
+            branch_taken = (then_mask != 0);
+            branch_target = (then_mask != 0) ? (curr_pc + imm_B(inst)) : (curr_pc + 4);
+        }
+        next_pc = branch_taken ? branch_target : (curr_pc + 4);
 
 pc_update:
         /* Update warp PC for all lanes */
@@ -563,6 +883,9 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
         }
     }
 
+    /* build CFG and compute correct reconv points */
+    gpgpu_core_build_cfg(s, (uint32_t)s->kernel.kernel_addr);
+
     for (int bx = 0; bx < s->kernel.grid_dim[0]; bx++) {
         for (int by = 0; by < s->kernel.grid_dim[1]; by++) {
             for (int bz = 0; bz < s->kernel.grid_dim[2]; bz++) {
@@ -588,5 +911,6 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
         }
     }
 
+    gpgpu_core_free_cfg(s);
     return 0;
 }
